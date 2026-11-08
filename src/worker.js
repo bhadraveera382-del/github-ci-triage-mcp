@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
-import { flagIntermittentTests, searchGitHubCode, triageGitHubFailure } from "./remote-core.js";
+import { flagIntermittentTests, listFailedWorkflowRuns, searchGitHubCode, triageGitHubFailure } from "./remote-core.js";
 
 const CLAUDE_ORIGINS = new Set([
   "https://claude.ai",
@@ -32,7 +32,7 @@ function registerTool(server, name, config, handler) {
 }
 
 export function createMcpServer(access = {}) {
-  const server = new McpServer({ name: "github-ci-triage", version: "0.2.0" });
+  const server = new McpServer({ name: "github-ci-triage", version: "0.3.0" });
 
   registerTool(server, "search_codebase", {
     title: "Search allowed GitHub code",
@@ -48,18 +48,32 @@ export function createMcpServer(access = {}) {
     }
   }, ({ owner, repo, ref, query, case_sensitive, max_results }) => searchGitHubCode({ owner, repo, ref, query, caseSensitive: case_sensitive, maxResults: max_results }, access));
 
-  registerTool(server, "triage_ci_failure", {
-    title: "Triage repository CI failure",
-    description: "Compare a supplied CI failure log with changed-file paths and GitHub diff snippets for an enabled repository. Provide both base_ref and head_ref. Does not write to GitHub or call a CI service.",
+  registerTool(server, "list_failed_workflow_runs", {
+    title: "List failed GitHub Actions runs",
+    description: "Read-only listing of recent completed failed workflow runs for a repository enabled for this connector. Supports an optional branch filter; never reruns or changes a workflow.",
     annotations: readOnlyAnnotations,
     inputSchema: {
       owner: repoPart.describe("GitHub user or organization that owns the enabled repository."),
       repo: repoPart.describe("Repository name; it must be on this connector's server-side allowlist."),
-      failure_log: z.string().min(1).max(60_000).describe("Relevant failing job log excerpt, pasted or copied from CI."),
-      base_ref: refPart.describe("Base branch or commit SHA for the GitHub comparison."),
-      head_ref: refPart.describe("Head branch or commit SHA for the GitHub comparison.")
+      branch: refPart.optional().describe("Optional branch name to filter failed runs."),
+      limit: z.number().int().min(1).max(25).default(10).describe("Maximum number of recent failed runs to return.")
     }
-  }, ({ owner, repo, failure_log, base_ref, head_ref }) => triageGitHubFailure({ owner, repo, failureLog: failure_log, baseRef: base_ref, headRef: head_ref }, access));
+  }, ({ owner, repo, branch, limit }) => listFailedWorkflowRuns({ owner, repo, branch, limit }, access));
+
+  registerTool(server, "triage_ci_failure", {
+    title: "Triage GitHub Actions failure",
+    description: "Read-only triage using a supplied failure log or automatically fetched logs from a selected failed run (run_id) or the latest completed failed run. Provide both base_ref and head_ref for a supplied log; automatic mode uses the run's pull request base or commit parent when available. Never reruns or changes workflows.",
+    annotations: readOnlyAnnotations,
+    inputSchema: {
+      owner: repoPart.describe("GitHub user or organization that owns the enabled repository."),
+      repo: repoPart.describe("Repository name; it must be on this connector's server-side allowlist."),
+      failure_log: z.string().min(1).max(60_000).optional().describe("Optional relevant failing job log excerpt. Omit to fetch logs from an Actions run."),
+      run_id: z.union([z.string().regex(/^\d{1,20}$/), z.number().int().positive()]).optional().describe("Optional numeric Actions run ID. When omitted in automatic mode, the latest completed failed run is selected."),
+      branch: refPart.optional().describe("Optional branch filter for automatic failed-run selection."),
+      base_ref: refPart.optional().describe("Optional base branch or commit SHA. Required with head_ref for a supplied log; automatic mode infers it when possible."),
+      head_ref: refPart.optional().describe("Optional head branch or commit SHA. Required with base_ref for a supplied log; automatic mode infers it when possible.")
+    }
+  }, ({ owner, repo, failure_log, run_id, branch, base_ref, head_ref }) => triageGitHubFailure({ owner, repo, failureLog: failure_log, runId: run_id, branch, baseRef: base_ref, headRef: head_ref }, access));
 
   registerTool(server, "flag_intermittent_tests", {
     title: "Flag intermittent test candidates",
@@ -140,7 +154,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed.", { status: 405, headers: { Allow: "GET, HEAD" } });
-      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.2.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
+      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.3.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
     }
     if (url.pathname !== "/mcp") return new Response("Not found.", { status: 404 });
     if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), request);
