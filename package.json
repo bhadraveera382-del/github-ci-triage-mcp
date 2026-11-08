@@ -1,0 +1,25 @@
+{
+  "name": "github-ci-triage-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only local and hosted MCP tools for GitHub and CI failure triage.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler deploy",
+    "worker:deploy:temporary": "wrangler deploy --temporary"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "wrangler": "^4.158.0"
+  }
+}
