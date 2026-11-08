@@ -1,0 +1,5 @@
+# Copy this file to .dev.vars and replace all placeholders.
+# Never commit .dev.vars or real credentials.
+GITHUB_TOKEN=REPLACE_WITH_SELECTED_REPOSITORY_READ_ONLY_TOKEN
+MCP_ACCESS_TOKEN=REPLACE_WITH_RANDOM_CONNECTOR_KEY_AT_LEAST_32_CHARACTERS
+GITHUB_ALLOWED_REPOS=owner/repository
