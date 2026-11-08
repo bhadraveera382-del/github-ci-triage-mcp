@@ -1,0 +1,8 @@
+[
+  { "test_name": "cart totals > handles discounts", "status": "passed", "run_id": "example-101" },
+  { "test_name": "cart totals > handles discounts", "status": "failed", "run_id": "example-102" },
+  { "test_name": "cart totals > handles discounts", "status": "passed", "run_id": "example-103" },
+  { "test_name": "auth > rejects invalid token", "status": "failed", "run_id": "example-101" },
+  { "test_name": "auth > rejects invalid token", "status": "failed", "run_id": "example-102" },
+  { "test_name": "auth > rejects invalid token", "status": "failed", "run_id": "example-103" }
+]
