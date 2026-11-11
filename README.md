@@ -2,7 +2,7 @@
 
 Read-only tools for investigating CI failures, available as a local stdio server or a hosted Streamable HTTP connector for Claude.
 
-The hosted server uses a server-side GitHub credential limited to selected repositories. It requires a separate connector access key and a repository allowlist; without all three settings it fails closed. No GitHub credential is accepted in tool inputs or returned to Claude.
+The hosted server uses a server-side GitHub credential and a separate connector access key. It requires all three settings—credential, connector key, and `GITHUB_ALLOWED_REPOS`—and fails closed when any is missing or invalid. The repository setting can name selected repositories, or use the sole value `*` as an explicit all-repositories-accessible-to-this-server-credential mode. No GitHub credential is accepted in tool inputs or returned to Claude.
 
 ## Tools
 
@@ -17,9 +17,9 @@ The failure classification and file ranking are deterministic heuristics, not pr
 
 ### GitHub access
 
-Use a fine-grained GitHub personal access token with only the intended repositories selected, **Contents: Read-only**, **Metadata: Read-only**, and **Actions: Read-only**. Actions read access is used only to list failed runs, list their jobs, and download failed-job logs. Choose a short, explicit expiry and rotate it before expiration. Do not grant write, administration, or account permissions.
+Use a fine-grained GitHub personal access token with **Contents: Read-only**, **Metadata: Read-only**, and **Actions: Read-only** only. Actions read access is used only to list failed runs, list their jobs, and download failed-job logs. Choose a short, explicit expiry and rotate it before expiration. Do not grant write, administration, or account permissions.
 
-The server also enforces an explicit `owner/repo` allowlist, independently of the token's permissions.
+`GITHUB_ALLOWED_REPOS` supports either selected `owner/repo` slugs or the exact sole value `*`. The wildcard is an explicit opt-in: it allows this shared connector key to read every repository that the server-side GitHub credential can read, including private repositories. GitHub organization policies and approval still apply. A fine-grained PAT is limited to one resource owner, so wildcard mode does not literally cover all collaborators or repositories across different owners.
 
 ### Encrypted Worker secrets
 
@@ -29,7 +29,7 @@ Configure these secret bindings in Cloudflare, not in source files or plaintext 
 | --- | --- |
 | `GITHUB_TOKEN` | Fine-grained read-only GitHub credential. Never sent to Claude. |
 | `MCP_ACCESS_TOKEN` | Separate cryptographically random connector key, at least 32 characters. Claude uses this key, not the GitHub token. |
-| `GITHUB_ALLOWED_REPOS` | Comma-separated allowed repository names, such as `owner/repo`. |
+| `GITHUB_ALLOWED_REPOS` | Selected comma-separated `owner/repo` names, or the exact sole value `*` for all repositories accessible to the server credential. |
 
 To develop locally, copy `.dev.vars.example` to `.dev.vars` and fill the values. `.dev.vars` is ignored by Git.
 
@@ -76,13 +76,13 @@ Set `TRIAGE_REPO_ROOT` to restrict calls to one checkout. Local tools accept `re
 ## Safety and limits
 
 - No write tools, commits, workflow dispatches/reruns/cancellations, GitHub mutations, or file edits are exposed.
-- The hosted endpoint requires its own access key, a server-side GitHub token, and a repository allowlist. Private code is not exposed through an unauthenticated URL.
+- The hosted endpoint requires its own access key, a server-side GitHub token, and a valid repository configuration. Private code is not exposed through an unauthenticated URL; wildcard mode is an explicit shared-key opt-in.
 - The GitHub token is sent only in authorization headers to `api.github.com`. The server refuses redirects and never places the token in a URL or tool result.
 - Temporary job-log download URLs are fetched without the GitHub authorization header, only over HTTPS from approved GitHub Actions/GitHub/AWS download hosts, and are never returned to the caller.
 - Hosted code, supplied CI logs, and test history are processed by the Worker and returned to the authenticated caller. The application does not persist request bodies or log them; the hosting provider still processes network requests under its policies.
 - Source search reads at most 30 eligible files per call, skips dependency/generated directories, hidden paths other than `.github`, binary files, and files over 1 MB. Check `scan_limit_reached` before treating results as complete.
 - GitHub API rate limits still apply to authenticated requests. Job logs are fetched only for up to five failed jobs per run and bounded to 1 MB each; comparison file lists and patches may be capped or omitted for large changes, so evidence may be incomplete.
-- This is a single-owner connector with a shared connector key, not a multi-user OAuth application. Anyone given that key can read the allowlisted repositories through these tools; keep the key private and rotate it if shared unintentionally.
+- This is a single-owner connector with a shared connector key, not a multi-user OAuth application. Anyone given that key can read the configured repositories through these tools; with wildcard mode that means every repository the server-side credential can read, including private repositories. Keep the key private and rotate it if shared unintentionally. A fine-grained PAT remains limited to its one resource owner and does not span all collaborators or organization repositories across owners.
 
 ## Development
 
