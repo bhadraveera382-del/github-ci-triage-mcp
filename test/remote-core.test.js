@@ -222,3 +222,103 @@ test("wildcard access reads a private repository but preserves upstream denial e
   mode = "not-found";
   await assert.rejects(searchGitHubCode({ owner: "acme", repo: "other", query: "private" }, wildcard), /not found/i);
 });
+
+test("automatic triage selects the older same-workflow branch event PR success and returns baseline evidence", async (t) => {
+  const requests = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    requests.push({ url, init });
+    assert.equal(init.method || "GET", "GET");
+    if (url.hostname === "pipelines.actions.githubusercontent.com") return new Response("TypeError: bad cart\n    at calculateCart (/runner/src/cart.js:2:3)\n", { status: 200 });
+    if (url.pathname === "/repos/acme/tiny") return jsonResponse({ private: true });
+    if (url.pathname === "/repos/acme/tiny/actions/runs/123") return jsonResponse({
+      id: 123, name: "CI", workflow_id: 9, run_number: 20, status: "completed", conclusion: "failure",
+      head_branch: "feature/cart", event: "pull_request", head_sha: "failedsha", created_at: "2026-11-10T10:00:00Z",
+      pull_requests: [{ number: 7, base: { sha: "base123" }, head: { sha: "real-failed-pr-head" } }]
+    });
+    if (url.pathname === "/repos/acme/tiny/actions/runs/123/jobs") return jsonResponse({ jobs: [{ id: 456, name: "tests", conclusion: "failure" }] });
+    if (url.pathname === "/repos/acme/tiny/actions/jobs/456/logs") return new Response(null, { status: 302, headers: { Location: "https://pipelines.actions.githubusercontent.com/signed/log" } });
+    if (url.pathname === "/repos/acme/tiny/compare/base123...real-failed-pr-head") return jsonResponse({ status: "ahead", files: [{ filename: "src/cart.js", status: "modified", patch: "+function calculateCart() {}" }] });
+    if (url.pathname === "/repos/acme/tiny/actions/workflows/9/runs" && url.searchParams.get("status") === "success") {
+      assert.equal(url.pathname, "/repos/acme/tiny/actions/workflows/9/runs");
+      assert.equal(url.searchParams.get("branch"), "feature/cart");
+      assert.equal(url.searchParams.get("event"), "pull_request");
+      assert.equal(url.searchParams.get("per_page"), "100");
+      assert.equal(url.searchParams.get("created"), "<=2026-11-10T10:00:00Z");
+      return jsonResponse({ total_count: 4, workflow_runs: [
+        { id: 1, workflow_id: 8, status: "completed", conclusion: "success", head_branch: "feature/cart", event: "pull_request", head_sha: "wrong-workflow", created_at: "2026-11-09T10:00:00Z", pull_requests: [{ number: 7, head: { sha: "older-pr-head" } }] },
+        { id: 2, workflow_id: 9, status: "completed", conclusion: "success", head_branch: "feature/cart", event: "pull_request", head_sha: "wrong-pr", created_at: "2026-11-08T10:00:00Z", pull_requests: [{ number: 8, head: { sha: "wrong-pr-head" } }] },
+        { id: 3, workflow_id: 9, status: "completed", conclusion: "success", head_branch: "feature/cart", event: "pull_request", head_sha: "future", created_at: "2026-11-11T10:00:00Z", pull_requests: [{ number: 7, head: { sha: "future-pr-head" } }] },
+        { id: 4, name: "CI", workflow_id: 9, status: "completed", conclusion: "success", head_branch: "feature/cart", event: "pull_request", head_sha: "successsha", created_at: "2026-11-08T10:00:00Z", pull_requests: [{ number: 7, head: { sha: "real-success-pr-head" } }] }
+      ] });
+    }
+    if (url.pathname === "/repos/acme/tiny/compare/real-success-pr-head...real-failed-pr-head") return jsonResponse({ status: "behind", ahead_by: 2, behind_by: 1, total_commits: 2, files: [{ filename: "src/cart.js", status: "modified", patch: "@@\n+calculateCart();" }] });
+    throw new Error(`Unexpected test request: ${url.href}`);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const result = await triageGitHubFailure({ owner: "acme", repo: "tiny", runId: "123" }, access);
+  assert.equal(result.baseline.status, "selected");
+  assert.equal(result.baseline.run.id, "4");
+  assert.equal(result.baseline.comparison, "real-success-pr-head...real-failed-pr-head");
+  assert.equal(result.baseline.non_linear, true);
+  assert.equal(result.baseline.likely_related_changed_files[0].log_quotes[0].text, "at calculateCart (/runner/src/cart.js:2:3)");
+  assert.deepEqual(result.baseline.likely_related_changed_files[0].diff_snippets, ["+calculateCart();"]);
+  assert.ok(requests.every(({ init }) => !init.method || init.method === "GET"));
+});
+
+test("automatic baseline reports missing metadata and does not fabricate history", async (t) => {
+  let actionRunsCalls = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(init.method || "GET", "GET");
+    if (url.pathname === "/repos/acme/tiny") return jsonResponse({ private: true });
+    if (url.pathname === "/repos/acme/tiny/actions/runs/124") return jsonResponse({ id: 124, status: "completed", conclusion: "failure", head_sha: "failedsha", pull_requests: [{ base: { sha: "base123" }, head: { sha: "failedsha" } }] });
+    if (url.pathname === "/repos/acme/tiny/actions/runs/124/jobs") return jsonResponse({ jobs: [{ id: 456, name: "tests", conclusion: "failure" }] });
+    if (url.pathname === "/repos/acme/tiny/actions/jobs/456/logs") return new Response(null, { status: 302, headers: { Location: "https://pipelines.actions.githubusercontent.com/signed/log" } });
+    if (url.hostname === "pipelines.actions.githubusercontent.com") return new Response("failure\n", { status: 200 });
+    if (url.pathname === "/repos/acme/tiny/compare/base123...failedsha") return jsonResponse({ files: [] });
+    if (url.pathname.endsWith("/actions/runs")) actionRunsCalls++;
+    throw new Error(`Unexpected test request: ${url.href}`);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const result = await triageGitHubFailure({ owner: "acme", repo: "tiny", runId: "124" }, access);
+  assert.equal(result.baseline.status, "unavailable");
+  assert.equal(result.baseline.reason, "missing_failed_run_metadata");
+  assert.equal(actionRunsCalls, 0);
+});
+
+
+test("stack source line numbers never become unrelated log quote line numbers", async (t) => {
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/acme/tiny") return jsonResponse({ private: true });
+    if (url.pathname === "/repos/acme/tiny/compare/main...next") return jsonResponse({ files: [{ filename: "src/cart.js", status: "modified", patch: "-old\n+new" }] });
+    throw new Error(`Unexpected test request: ${url.href}`);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const result = await triageGitHubFailure({ owner: "acme", repo: "tiny", baseRef: "main", headRef: "next", failureLog: "TypeError\n    at calculateCart (/runner/src/cart.js:999:3)" }, access);
+  assert.deepEqual(result.likely_related_changed_files[0].log_quotes, [{ line: 2, text: "at calculateCart (/runner/src/cart.js:999:3)" }]);
+});
+
+test("baseline comparison reports missing patches independently of commit count and treats identical as linear", async (t) => {
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/acme/tiny") return jsonResponse({ private: true });
+    if (url.pathname === "/repos/acme/tiny/actions/runs/200") return jsonResponse({ id: 200, workflow_id: 9, status: "completed", conclusion: "failure", head_branch: "main", event: "push", head_sha: "failed", created_at: "2026-11-10T10:00:00Z", pull_requests: [{ number: 1, base: { sha: "base" }, head: { sha: "failed" } }] });
+    if (url.pathname === "/repos/acme/tiny/actions/runs/200/jobs") return jsonResponse({ jobs: [{ id: 201, name: "test", conclusion: "failure" }] });
+    if (url.pathname === "/repos/acme/tiny/actions/jobs/201/logs") return new Response(null, { status: 302, headers: { Location: "https://pipelines.actions.githubusercontent.com/signed/log" } });
+    if (url.hostname === "pipelines.actions.githubusercontent.com") return new Response("failure\n", { status: 200 });
+    if (url.pathname === "/repos/acme/tiny/compare/base...failed") return jsonResponse({ files: [] });
+    if (url.pathname === "/repos/acme/tiny/compare/old...failed") return jsonResponse({ status: "identical", total_commits: 99, files: [{ filename: "src/a.js", status: "modified" }] });
+    if (url.pathname === "/repos/acme/tiny/actions/workflows/9/runs") return jsonResponse({ total_count: 2, workflow_runs: [
+      { id: 100, workflow_id: 9, status: "completed", conclusion: "success", head_branch: "main", event: "push", head_sha: "old", created_at: "2026-11-09T10:00:00Z", pull_requests: [{ number: 1 }] },
+      { id: 101, workflow_id: 9, status: "completed", conclusion: "success", head_branch: "main", event: "push", head_sha: "missing-date" }
+    ] });
+    throw new Error(`Unexpected test request: ${url.href}`);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const result = await triageGitHubFailure({ owner: "acme", repo: "tiny", runId: "200" }, access);
+  assert.equal(result.baseline.non_linear, false);
+  assert.equal(result.baseline.patches_incomplete, true);
+  assert.deepEqual(result.baseline.missing_patch_files, ["src/a.js"]);
+});
