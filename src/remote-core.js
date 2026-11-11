@@ -45,7 +45,8 @@ function enforceRepositoryAccess(owner, repo, access) {
   if (access.token && (!(allowed instanceof Set) || allowed.size === 0)) {
     throw new Error("Authenticated GitHub access requires a configured repository allowlist.");
   }
-  if (allowed instanceof Set && !allowed.has(slug)) {
+  const wildcardAccess = Boolean(access.token) && allowed instanceof Set && allowed.size === 1 && allowed.has("*");
+  if (allowed instanceof Set && !wildcardAccess && !allowed.has(slug)) {
     throw new Error("This repository is not enabled for this hosted connector.");
   }
 }

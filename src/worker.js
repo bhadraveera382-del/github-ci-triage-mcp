@@ -32,15 +32,15 @@ function registerTool(server, name, config, handler) {
 }
 
 export function createMcpServer(access = {}) {
-  const server = new McpServer({ name: "github-ci-triage", version: "0.3.0" });
+  const server = new McpServer({ name: "github-ci-triage", version: "0.4.0" });
 
   registerTool(server, "search_codebase", {
     title: "Search allowed GitHub code",
-    description: "Read-only literal, case-insensitive-by-default search through source and text files in a repository enabled for this connector. Reads at most 30 eligible files per call and marks partial scans. The GitHub credential stays server-side.",
+    description: "Read-only literal, case-insensitive-by-default search through source and text files in a repository accessible to this connector. Reads at most 30 eligible files per call and marks partial scans. The GitHub credential stays server-side.",
     annotations: readOnlyAnnotations,
     inputSchema: {
-      owner: repoPart.describe("GitHub user or organization that owns the enabled repository."),
-      repo: repoPart.describe("Repository name; it must be on this connector's server-side allowlist."),
+      owner: repoPart.describe("GitHub user or organization that owns the repository."),
+      repo: repoPart.describe("Repository name accessible to this connector."),
       ref: refPart.optional().describe("Optional branch, tag, or commit SHA; defaults to the repository's default branch."),
       query: z.string().min(1).max(200).describe("Literal text to find; regular expressions are not interpreted."),
       case_sensitive: z.boolean().default(false),
@@ -50,11 +50,11 @@ export function createMcpServer(access = {}) {
 
   registerTool(server, "list_failed_workflow_runs", {
     title: "List failed GitHub Actions runs",
-    description: "Read-only listing of recent completed failed workflow runs for a repository enabled for this connector. Supports an optional branch filter; never reruns or changes a workflow.",
+    description: "Read-only listing of recent completed failed workflow runs for a repository accessible to this connector. Supports an optional branch filter; never reruns or changes a workflow.",
     annotations: readOnlyAnnotations,
     inputSchema: {
-      owner: repoPart.describe("GitHub user or organization that owns the enabled repository."),
-      repo: repoPart.describe("Repository name; it must be on this connector's server-side allowlist."),
+      owner: repoPart.describe("GitHub user or organization that owns the repository."),
+      repo: repoPart.describe("Repository name accessible to this connector."),
       branch: refPart.optional().describe("Optional branch name to filter failed runs."),
       limit: z.number().int().min(1).max(25).default(10).describe("Maximum number of recent failed runs to return.")
     }
@@ -65,8 +65,8 @@ export function createMcpServer(access = {}) {
     description: "Read-only triage using a supplied failure log or automatically fetched logs from a selected failed run (run_id) or the latest completed failed run. Provide both base_ref and head_ref for a supplied log; automatic mode uses the run's pull request base or commit parent when available. Never reruns or changes workflows.",
     annotations: readOnlyAnnotations,
     inputSchema: {
-      owner: repoPart.describe("GitHub user or organization that owns the enabled repository."),
-      repo: repoPart.describe("Repository name; it must be on this connector's server-side allowlist."),
+      owner: repoPart.describe("GitHub user or organization that owns the repository."),
+      repo: repoPart.describe("Repository name accessible to this connector."),
       failure_log: z.string().min(1).max(60_000).optional().describe("Optional relevant failing job log excerpt. Omit to fetch logs from an Actions run."),
       run_id: z.union([z.string().regex(/^\d{1,20}$/), z.number().int().positive()]).optional().describe("Optional numeric Actions run ID. When omitted in automatic mode, the latest completed failed run is selected."),
       branch: refPart.optional().describe("Optional branch filter for automatic failed-run selection."),
@@ -96,9 +96,12 @@ export function createMcpServer(access = {}) {
 export function configuredAccess(env) {
   const githubToken = typeof env.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
   const mcpToken = typeof env.MCP_ACCESS_TOKEN === "string" ? env.MCP_ACCESS_TOKEN.trim() : "";
-  const configuredRepos = typeof env.GITHUB_ALLOWED_REPOS === "string" ? env.GITHUB_ALLOWED_REPOS.split(/[,\n]/).map((value) => value.trim().toLowerCase()).filter(Boolean) : [];
+  const rawRepos = typeof env.GITHUB_ALLOWED_REPOS === "string" ? env.GITHUB_ALLOWED_REPOS.split(/[,\n]/) : [];
+  const configuredRepos = rawRepos.map((value) => value.trim().toLowerCase());
   if (!githubToken || /\s/.test(githubToken) || mcpToken.length < 32 || mcpToken.length > 512 || /\s/.test(mcpToken)) return null;
-  if (configuredRepos.length === 0 || configuredRepos.length > 10 || configuredRepos.some((value) => !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(value))) return null;
+  const hasInvalidRepo = configuredRepos.some((value) => !value || (value !== "*" && !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(value)));
+  const hasMixedWildcard = configuredRepos.includes("*") && (configuredRepos.length !== 1 || configuredRepos[0] !== "*");
+  if (configuredRepos.length === 0 || configuredRepos.length > 10 || hasInvalidRepo || hasMixedWildcard) return null;
   return { token: githubToken, mcpToken, allowedRepos: new Set(configuredRepos) };
 }
 
@@ -154,7 +157,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed.", { status: 405, headers: { Allow: "GET, HEAD" } });
-      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.3.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
+      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.4.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
     }
     if (url.pathname !== "/mcp") return new Response("Not found.", { status: 404 });
     if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), request);
