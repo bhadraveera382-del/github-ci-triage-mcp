@@ -14,6 +14,8 @@ const MAX_FILE_BYTES = 1_000_000;
 const MAX_REMOTE_SCAN_FILES = 30;
 const MAX_FAILURE_LOG_CHARS = 60_000;
 const MAX_FAILED_RUNS = 25;
+const MAX_SUCCESSFUL_RUNS = 100;
+const MAX_EVIDENCE_ITEMS = 3;
 const MAX_FAILED_JOBS = 5;
 const MAX_JOB_LOG_BYTES = 1_000_000;
 const STACK_FILE_RE = /(?:^|[\s(])((?:\.{0,2}\/)?[\w@./\\-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|java|go|rs|rb|php|cs|cpp|h|hpp|sql|vue|svelte|swift|kt)):(\d+)(?::\d+)?/gim;
@@ -320,11 +322,46 @@ function matchesReference(changedPath, references) {
   });
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function boundedLogQuotes(path, log, references, symbols = []) {
+  const lines = log.split(/\r?\n/);
+  const normalizedPath = normalizeRelative(path).toLowerCase();
+  const name = normalizedPath.split("/").at(-1);
+  const pathReferences = references.filter((item) => normalizeRelative(item.path).toLowerCase() === normalizedPath);
+  const wantedSymbols = symbols.length ? symbols : symbolsFromLog(log);
+  const quotes = [];
+  for (const [index, line] of lines.entries()) {
+    const normalizedLine = normalizeRelative(line).toLowerCase();
+    const pathMatch = normalizedLine.includes(normalizedPath) || (name.length > 3 && normalizedLine.includes(name));
+    const symbolMatch = wantedSymbols.some((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
+    if (pathMatch || (pathReferences.length > 0 && symbolMatch)) {
+      const text = line.trim();
+      if (text) quotes.push({ line: index + 1, text: text.slice(0, 400) });
+    }
+    if (quotes.length >= MAX_EVIDENCE_ITEMS) break;
+  }
+  return quotes;
+}
+
+function patchSnippets(patch, symbols = []) {
+  const lines = String(patch || "").split(/\r?\n/)
+    .filter((line) => (line.startsWith("+") || line.startsWith("-")) && !line.startsWith("+++") && !line.startsWith("---"));
+  const relevant = symbols.length
+    ? lines.filter((line) => symbols.some((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line)))
+    : [];
+  return (relevant.length ? relevant : lines).slice(0, MAX_EVIDENCE_ITEMS).map((text) => text.slice(0, 400));
+}
+
 function scoreChangedFiles(changedFiles, references, symbols, log) {
   const scores = [];
   for (const item of changedFiles) {
     let score = 0;
     const evidence = [];
+    const logQuotes = boundedLogQuotes(item.path, log, references, symbols);
+    const diffSnippets = patchSnippets(item.patch, symbols);
     if (matchesReference(item.path, references)) {
       score += 100;
       evidence.push("path appears in a stack trace");
@@ -335,12 +372,12 @@ function scoreChangedFiles(changedFiles, references, symbols, log) {
       evidence.push("filename is mentioned in the failure log");
     }
     const patch = typeof item.patch === "string" ? item.patch : "";
-    const hits = symbols.filter((symbol) => new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(patch));
+    const hits = symbols.filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(patch));
     if (hits.length) {
       score += Math.min(hits.length * 8, 32);
       evidence.push(`contains stack-frame symbol${hits.length === 1 ? "" : "s"} in the GitHub diff: ${hits.join(", ")}`);
     }
-    if (score > 0) scores.push({ path: item.path, status: item.status, score, evidence });
+    if (score > 0) scores.push({ path: item.path, status: item.status, score, evidence, log_quotes: logQuotes, diff_snippets: diffSnippets });
   }
   scores.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
   return scores.slice(0, 15);
@@ -423,6 +460,92 @@ async function comparisonRefs({ baseRef, headRef, run, repositoryPath, access })
   return { base: validateRef(parent, "base_ref"), head: validateRef(run.head_sha, "head_ref") };
 }
 
+function pullRequestIdentity(run) {
+  const pr = Array.isArray(run?.pull_requests) ? run.pull_requests[0] : null;
+  if (!pr) return null;
+  return pr.number != null ? `number:${pr.number}` : (pr.url || pr.html_url || (pr.head?.ref && pr.base?.ref ? `refs:${pr.base.ref}->${pr.head.ref}` : null));
+}
+
+function runTimestamp(value) {
+  const timestamp = typeof value === "string" || typeof value === "number" ? new Date(value).getTime() : NaN;
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function selectedPullRequestHeadSha(run) {
+  const pullRequest = Array.isArray(run?.pull_requests)
+    ? run.pull_requests.find((item) => typeof item?.head?.sha === "string" && item.head.sha)
+    : null;
+  return pullRequest?.head?.sha || null;
+}
+
+function sameBaselineRun(candidate, failedRun, failedPrIdentity, failedTimestamp) {
+  if (!candidate || String(candidate.id) === String(failedRun.id) || candidate.status !== "completed" || candidate.conclusion !== "success") return false;
+  if (String(candidate.workflow_id) !== String(failedRun.workflow_id)) return false;
+  if ((candidate.head_branch || null) !== (failedRun.head_branch || null)) return false;
+  if ((candidate.event || null) !== (failedRun.event || null)) return false;
+  if (failedPrIdentity && pullRequestIdentity(candidate) !== failedPrIdentity) return false;
+  const candidateTimestamp = runTimestamp(candidate.created_at);
+  if (candidateTimestamp === null || failedTimestamp === null || candidateTimestamp >= failedTimestamp) return false;
+  return Boolean(candidate.head_sha);
+}
+
+function comparisonFiles(data) {
+  return (Array.isArray(data?.files) ? data.files : []).map((file) => ({
+    status: file.status === "renamed" ? "R" : file.status === "added" ? "A" : file.status === "removed" ? "D" : "M",
+    path: normalizeRelative(file.filename),
+    patch: file.patch || ""
+  }));
+}
+
+async function findSuccessfulBaseline({ failedRun, repositoryPath, access }) {
+  const metadata = { workflow_id: failedRun.workflow_id, branch: failedRun.head_branch || null, event: failedRun.event || null, pull_request: pullRequestIdentity(failedRun) };
+  const failedTimestamp = runTimestamp(failedRun.created_at);
+  if (!failedRun.workflow_id || !failedRun.head_branch || !failedRun.event || failedTimestamp === null) {
+    return { status: "unavailable", reason: "missing_failed_run_metadata", metadata, search_capped: false };
+  }
+  const query = new URLSearchParams({ status: "success", branch: failedRun.head_branch, event: failedRun.event, per_page: String(MAX_SUCCESSFUL_RUNS), created: `<=${failedRun.created_at}` });
+  const workflowPath = `${repositoryPath}/actions/workflows/${encodeURIComponent(String(failedRun.workflow_id))}/runs`;
+  const result = await githubJson(`${workflowPath}?${query}`, access);
+  const runs = Array.isArray(result.workflow_runs) ? result.workflow_runs : [];
+  const failedPrIdentity = pullRequestIdentity(failedRun);
+  const eligible = runs.filter((candidate) => sameBaselineRun(candidate, failedRun, failedPrIdentity, failedTimestamp));
+  eligible.sort((a, b) => runTimestamp(b.created_at) - runTimestamp(a.created_at));
+  const baseline = eligible[0];
+  const searchCapped = runs.length >= MAX_SUCCESSFUL_RUNS || Number(result.total_count) > runs.length;
+  if (!baseline) return { status: "unavailable", reason: "no_eligible_successful_run_in_history", metadata, search_capped: searchCapped };
+  return { status: "selected", run: summarizeWorkflowRun(baseline), rawRun: baseline, metadata, search_capped: searchCapped };
+}
+
+async function compareBaseline({ baseline, failedRun, repositoryPath, access, failureLog, references, symbols }) {
+  if (baseline.status !== "selected") return baseline;
+  const baselineHead = selectedPullRequestHeadSha(baseline.rawRun) || baseline.rawRun.head_sha;
+  const failedHead = selectedPullRequestHeadSha(failedRun) || failedRun.head_sha;
+  if (!baselineHead || !failedHead) return { ...baseline, status: "unavailable", reason: "missing_comparison_head_sha" };
+  const comparisonData = await githubJson(`${repositoryPath}/compare/${encodeURIComponent(baselineHead)}...${encodeURIComponent(failedHead)}`, access);
+  const files = comparisonFiles(comparisonData);
+  const missingPatchFiles = files.filter((file) => !file.patch).map((file) => file.path);
+  const comparisonFileListCapped = files.length >= 300;
+  const ranked = scoreChangedFiles(files, references, symbols, failureLog);
+  return {
+    status: "selected",
+    run: baseline.run,
+    comparison: `${baselineHead}...${failedHead}`,
+    changed_file_count: files.length,
+    changed_files: files.slice(0, 100).map(({ status, path }) => ({ status, path })),
+    changed_files_truncated: files.length > 100,
+    likely_related_changed_files: ranked,
+    search_capped: baseline.search_capped,
+    non_linear: comparisonData.status ? ["behind", "diverged"].includes(comparisonData.status) : null,
+    comparison_status: comparisonData.status || null,
+    comparison_ahead_by: comparisonData.ahead_by ?? null,
+    comparison_behind_by: comparisonData.behind_by ?? null,
+    patches_incomplete: missingPatchFiles.length > 0,
+    missing_patch_files: missingPatchFiles,
+    comparison_file_list_capped: comparisonFileListCapped,
+    note: "Baseline compares the selected older successful run head to the failed run head; it is a heuristic reference, not proof of causation."
+  };
+}
+
 export async function triageGitHubFailure({ owner, repo, failureLog, runId, branch, baseRef, headRef }, access = {}) {
   const suppliedLog = typeof failureLog === "string" && Boolean(failureLog.trim());
   if (failureLog !== undefined && !suppliedLog) throw new Error("failure_log must not be empty when provided.");
@@ -447,17 +570,16 @@ export async function triageGitHubFailure({ owner, repo, failureLog, runId, bran
   const base = refs.base;
   const head = refs.head;
   const comparisonData = await githubJson(`${path}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`, access);
-  const allChangedFiles = (comparisonData.files || []).map((file) => ({
-    status: file.status === "renamed" ? "R" : file.status === "added" ? "A" : file.status === "removed" ? "D" : "M",
-    path: normalizeRelative(file.filename),
-    patch: file.patch || ""
-  }));
+  const allChangedFiles = comparisonFiles(comparisonData);
   const references = extractFileReferences(log);
   const symbols = symbolsFromLog(log);
   const likelyChangedFiles = scoreChangedFiles(allChangedFiles, references, symbols, log);
   const failure = classifyFailure(log);
   const failureLines = extractFailureLines(log);
   const directFileMatches = likelyChangedFiles.filter((item) => item.evidence.includes("path appears in a stack trace"));
+  const baseline = fetched
+    ? await compareBaseline({ baseline: await findSuccessfulBaseline({ failedRun: fetched.run, repositoryPath: path, access }), failedRun: fetched.run, repositoryPath: path, access, failureLog: log, references, symbols })
+    : { status: "not_applicable", reason: "provided_log_mode" };
   let summary;
   if (likelyChangedFiles.length) {
     summary = `${failure.summary} ${directFileMatches.length ? "Stack-trace paths overlap the changed files." : "Changed-file names or GitHub diff snippets provide a possible connection."}`;
@@ -477,6 +599,7 @@ export async function triageGitHubFailure({ owner, repo, failureLog, runId, bran
     likely_related_changed_files: likelyChangedFiles,
     stack_trace_files: references,
     failure_evidence: failureLines,
+    baseline,
     source: fetched ? {
       type: "github_actions",
       workflow_run: summarizeWorkflowRun(fetched.run),

@@ -32,7 +32,7 @@ function registerTool(server, name, config, handler) {
 }
 
 export function createMcpServer(access = {}) {
-  const server = new McpServer({ name: "github-ci-triage", version: "0.4.0" });
+  const server = new McpServer({ name: "github-ci-triage", version: "0.5.0" });
 
   registerTool(server, "search_codebase", {
     title: "Search allowed GitHub code",
@@ -62,7 +62,7 @@ export function createMcpServer(access = {}) {
 
   registerTool(server, "triage_ci_failure", {
     title: "Triage GitHub Actions failure",
-    description: "Read-only triage using a supplied failure log or automatically fetched logs from a selected failed run (run_id) or the latest completed failed run. Provide both base_ref and head_ref for a supplied log; automatic mode uses the run's pull request base or commit parent when available. Never reruns or changes workflows.",
+    description: "Read-only triage using a supplied failure log or automatically fetched logs from a selected failed run (run_id) or the latest completed failed run. Provide both base_ref and head_ref for a supplied log; automatic mode uses the run's pull request base or commit parent when available and separately compares it with the latest eligible older successful run of the same workflow, branch, event, and PR. Never reruns or changes workflows.",
     annotations: readOnlyAnnotations,
     inputSchema: {
       owner: repoPart.describe("GitHub user or organization that owns the repository."),
@@ -157,7 +157,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed.", { status: 405, headers: { Allow: "GET, HEAD" } });
-      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.4.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
+      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.5.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
     }
     if (url.pathname !== "/mcp") return new Response("Not found.", { status: 404 });
     if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), request);
