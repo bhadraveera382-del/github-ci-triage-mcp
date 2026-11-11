@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker from "../src/worker.js";
+import worker, { configuredAccess } from "../src/worker.js";
 
 const env = {
   GITHUB_TOKEN: "fixture-read-only-github-token",
@@ -50,6 +50,7 @@ test("Worker exposes only the four read-only tools to an authenticated caller", 
   const triage = body.result.tools.find((tool) => tool.name === "triage_ci_failure");
   assert.ok(triage.inputSchema.properties.run_id);
   assert.ok(!triage.inputSchema.required?.includes("failure_log"));
+  assert.ok(body.result.tools.every((tool) => !Object.keys(tool.inputSchema.properties || {}).some((key) => /token|credential|secret/i.test(key))));
 });
 
 test("authenticated tool calls cannot access a repository outside the allowlist", async (t) => {
@@ -62,4 +63,12 @@ test("authenticated tool calls cannot access a repository outside the allowlist"
   assert.equal(body.result.isError, true);
   assert.match(body.result.content[0].text, /not enabled/i);
   assert.equal(outgoingRequests, 0);
+});
+
+
+test("configuredAccess accepts the sole wildcard and rejects missing or mixed wildcard configuration", () => {
+  assert.deepEqual([...configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "*" }).allowedRepos], ["*"]);
+  assert.equal(configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "" }), null);
+  assert.equal(configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "*,acme/tiny" }), null);
+  assert.equal(configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "acme/tiny,*" }), null);
 });

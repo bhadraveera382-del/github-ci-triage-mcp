@@ -197,3 +197,28 @@ test("searchGitHubCode surfaces upstream rate limits instead of returning a fals
   t.after(() => { globalThis.fetch = originalFetch; });
   await assert.rejects(searchGitHubCode({ owner: "acme", repo: "tiny", query: "message" }, access), /rate limit/i);
 });
+
+
+test("wildcard access reads a private repository but preserves upstream denial errors", async (t) => {
+  const wildcard = { token: "fixture-read-only-token", allowedRepos: new Set(["*"]) };
+  let mode = "private";
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/acme/other") {
+      if (mode === "private") return jsonResponse({ private: true, default_branch: "main" });
+      if (mode === "not-found") return jsonResponse({ message: "not found" }, 404);
+      return jsonResponse({ message: "forbidden" }, 403);
+    }
+    if (url.pathname === "/repos/acme/other/commits/main") return jsonResponse({ sha: "abc123" });
+    if (url.pathname === "/repos/acme/other/git/trees/abc123") return jsonResponse({ tree: [{ type: "blob", path: "src/app.js", size: 10, sha: "blob1" }] });
+    if (url.pathname === "/repos/acme/other/git/blobs/blob1") return jsonResponse({ encoding: "base64", size: 10, content: btoa("private hit") });
+    throw new Error(`Unexpected test request: ${url.href}`);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const result = await searchGitHubCode({ owner: "acme", repo: "other", query: "private" }, wildcard);
+  assert.equal(result.total_matches, 1);
+  mode = "denied";
+  await assert.rejects(searchGitHubCode({ owner: "acme", repo: "other", query: "private" }, wildcard), /refused the read/i);
+  mode = "not-found";
+  await assert.rejects(searchGitHubCode({ owner: "acme", repo: "other", query: "private" }, wildcard), /not found/i);
+});
