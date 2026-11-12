@@ -86,3 +86,54 @@ test("mixed outcomes below min_runs are labeled possible candidates", () => {
   });
   assert.equal(result.intermittent_test_candidates[0].confidence, "possible_candidate_insufficient_history");
 });
+
+test("triageFailure only ranks symbols present on changed diff lines", async (t) => {
+  const repo = await makeGitRepo();
+  t.after(() => fs.rm(repo, { recursive: true, force: true }));
+  await fs.mkdir(path.join(repo, "src"), { recursive: true });
+  await fs.writeFile(path.join(repo, "src", "context.js"), "export function stable() { return 1; }\nexport function ContextOnly() { return 2; }\nexport const untouched = 1;\n");
+  await fs.writeFile(path.join(repo, "src", "changed.js"), "export function oldValue() { return 1; }\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "baseline");
+  const base = git(repo, "rev-parse", "HEAD");
+  await fs.writeFile(path.join(repo, "src", "context.js"), "export function stable() { return 1; }\nexport function ContextOnly() { return 2; }\nexport const untouched = 2;\n");
+  await fs.writeFile(path.join(repo, "src", "changed.js"), "export function ChangedSymbol() { return 2; }\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "change symbol");
+  const head = git(repo, "rev-parse", "HEAD");
+
+  const result = await triageFailure({
+    repoPath: repo, baseRef: base, headRef: head,
+    failureLog: "TypeError\n    at ContextOnly (/runner/src/context.js:2:1)\n    at ChangedSymbol (/runner/src/changed.js:1:1)"
+  });
+  const context = result.likely_related_changed_files.find((file) => file.path === "src/context.js");
+  const changed = result.likely_related_changed_files.find((file) => file.path === "src/changed.js");
+  assert.ok(context);
+  assert.deepEqual(context.matching_symbols, []);
+  assert.ok(!context.match_kinds.includes("changed_line_symbol_overlap"));
+  assert.ok(changed.match_kinds.includes("changed_line_symbol_overlap"));
+  assert.deepEqual(changed.matching_symbols, ["ChangedSymbol"]);
+  assert.equal(result.root_cause_established, false);
+  assert.ok(result.evidence?.items?.length);
+  assert.ok(result.diagnostic_claims.every((claim) => claim.evidence_ids.every((id) => result.evidence.items.some((item) => item.id === id))));
+  assert.equal(result.evidence.sources.find((source) => source.id === "provided_log").line_number_scope, "caller_supplied_excerpt_not_original_ci_log");
+  assert.equal(result.evidence.sources.find((source) => source.id === "local:comparison").type, "local_git_diff");
+});
+
+test("working-tree context and unchanged symbols do not rank without changed-line evidence", async (t) => {
+  const repo = await makeGitRepo();
+  t.after(() => fs.rm(repo, { recursive: true, force: true }));
+  await fs.mkdir(path.join(repo, "src"), { recursive: true });
+  await fs.writeFile(path.join(repo, "src", "app.js"), "export function ExistingSymbol() { return 1; }\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "baseline");
+  await fs.writeFile(path.join(repo, "src", "app.js"), "export function ExistingSymbol() { return 1; }\nexport function UnchangedSymbol() { return 2; }\n");
+  const result = await triageFailure({
+    repoPath: repo,
+    failureLog: "TypeError\n    at ExistingSymbol (/runner/src/app.js:1:1)"
+  });
+  assert.equal(result.likely_related_changed_files.length, 1);
+  assert.deepEqual(result.likely_related_changed_files[0].matching_symbols, []);
+  assert.ok(!result.likely_related_changed_files[0].match_kinds.includes("changed_line_symbol_overlap"));
+  assert.equal(result.comparison, "working tree vs HEAD");
+});
