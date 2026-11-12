@@ -1,8 +1,8 @@
 # GitHub + CI Triage MCP
 
-Read-only tools for investigating CI failures, available as a local stdio server or a hosted Streamable HTTP connector for Claude.
+Read-only tools for investigating CI failures, available as a local stdio server or a hosted Streamable HTTP connector for Claude and ChatGPT.
 
-The hosted server uses a server-side GitHub credential and a separate connector access key. It requires all three settings—credential, connector key, and `GITHUB_ALLOWED_REPOS`—and fails closed when any is missing or invalid. The repository setting can name selected repositories, or use the sole value `*` as an explicit all-repositories-accessible-to-this-server-credential mode. No GitHub credential is accepted in tool inputs or returned to Claude.
+The hosted server uses a server-side GitHub credential and separate connector access keys. It requires `GITHUB_TOKEN`, the existing Claude key `MCP_ACCESS_TOKEN`, and `GITHUB_ALLOWED_REPOS`; `CHATGPT_MCP_ACCESS_TOKEN` is optional and independently enables ChatGPT. The server fails closed when required settings are missing or invalid. The repository setting can name selected repositories, or use the sole value `*` as an explicit all-repositories-accessible-to-this-server-credential mode. No GitHub credential is accepted in tool inputs or returned to either connector.
 
 ## Tools
 
@@ -36,6 +36,7 @@ Configure these secret bindings in Cloudflare, not in source files or plaintext 
 | --- | --- |
 | `GITHUB_TOKEN` | Fine-grained read-only GitHub credential. Never sent to Claude. |
 | `MCP_ACCESS_TOKEN` | Separate cryptographically random connector key, at least 32 characters. Claude uses this key, not the GitHub token. |
+| `CHATGPT_MCP_ACCESS_TOKEN` | Optional, separate cryptographically random connector key, at least 32 characters. ChatGPT uses this key; it does not replace Claude's key. |
 | `GITHUB_ALLOWED_REPOS` | Selected comma-separated `owner/repo` names, or the exact sole value `*` for all repositories accessible to the server credential. |
 
 To develop locally, copy `.dev.vars.example` to `.dev.vars` and fill the values. `.dev.vars` is ignored by Git.
@@ -53,10 +54,11 @@ npx wrangler login
 npm run worker:deploy
 npx wrangler secret put GITHUB_TOKEN
 npx wrangler secret put MCP_ACCESS_TOKEN
+npx wrangler secret put CHATGPT_MCP_ACCESS_TOKEN
 npx wrangler secret put GITHUB_ALLOWED_REPOS
 ```
 
-Until the complete secret configuration is present, `/mcp` returns `503` and no tool can run. A missing or incorrect connector key returns `401`. The `/health` endpoint shows readiness without exposing credentials or repository names.
+`CHATGPT_MCP_ACCESS_TOKEN` is optional; do not change or remove `MCP_ACCESS_TOKEN` when enabling ChatGPT. Until the required secret configuration is present, `/mcp` returns `503` and no tool can run. A missing or incorrect connector key returns `401`. The `/health` endpoint shows readiness without exposing credentials or repository names.
 
 Wrangler also supports `npm run worker:deploy:temporary` without a prior login. This requires accepting Cloudflare's ordinary service terms, creates a claimable preview account, and must be claimed by the intended user within 60 minutes or Cloudflare deletes it. A claimed, permanent account is preferable for a Claude connector.
 
@@ -66,7 +68,11 @@ Add a custom remote connector in **Customize → Connectors** using the public W
 
 This implementation uses a fixed request header rather than an OAuth authorization server. Configure **No sign in** for OAuth and add an **Authorization** request header whose value is `Bearer <connector-access-key>`. Use only the separate `MCP_ACCESS_TOKEN` here—never the GitHub credential. Claude supports fixed credentials in custom connector request headers.
 
-Claude connects from its cloud infrastructure, so the endpoint must be reachable over the public internet. The Worker validates incoming origins and accepts its own origin, Claude's web origins, or requests without an `Origin` header.
+Claude connects from its cloud infrastructure, so the endpoint must be reachable over the public internet. The Worker validates incoming origins and accepts its own origin, Claude's web origins, ChatGPT's web origin, or requests without an `Origin` header.
+
+### Add it to ChatGPT
+
+In ChatGPT, choose **Add custom MCP server** (the exact location can vary by account or workspace), enter the public Worker URL ending in `/mcp`, and configure bearer/API-key authentication. If the form asks for a header name and value, use `Authorization` and `Bearer <CHATGPT_MCP_ACCESS_TOKEN>`. Use only the ChatGPT key here—never the Claude key or GitHub credential. The server accepts the `https://chatgpt.com` origin and exposes read-only GitHub/CI tools.
 
 ## Local stdio server
 

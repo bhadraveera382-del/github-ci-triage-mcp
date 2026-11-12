@@ -2,6 +2,7 @@
 # Never commit .dev.vars or real credentials.
 GITHUB_TOKEN=REPLACE_WITH_SELECTED_REPOSITORY_READ_ONLY_TOKEN
 MCP_ACCESS_TOKEN=REPLACE_WITH_RANDOM_CONNECTOR_KEY_AT_LEAST_32_CHARACTERS
+CHATGPT_MCP_ACCESS_TOKEN=REPLACE_WITH_A_DIFFERENT_RANDOM_KEY_AT_LEAST_32_CHARACTERS
 # Specific mode: comma-separated owner/repository slugs.
 # Explicit all-accessible mode: use the sole value '*' (no other entries).
 # The server credential must still be a fine-grained, read-only GitHub token.
