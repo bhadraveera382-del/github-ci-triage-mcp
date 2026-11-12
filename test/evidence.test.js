@@ -211,7 +211,7 @@ test("exact 60000-character logs are not marked truncated and job names do not b
     if (url.hostname === "pipelines.actions.githubusercontent.com") return new Response("setup complete\n".padEnd(length, "x"));
     if (url.pathname === "/repos/acme/tiny") return jsonResponse({ private: true });
     if (url.pathname.endsWith("/actions/runs/99")) return jsonResponse({ id: 99, status: "completed", conclusion: "failure", head_sha: "head", pull_requests: [{ base: { sha: "base" }, head: { sha: "head" } }] });
-    if (url.pathname.endsWith("/runs/99/jobs")) return jsonResponse({ total_count: 1, jobs: [{ id: 1, name: "TypeError timeout src/cart.js", conclusion: "failure" }] });
+    if (url.pathname.endsWith("/runs/99/jobs")) return jsonResponse({ total_count: 1, jobs: [{ id: 1, name: "TypeError timeout src/cart.js", conclusion: "failure", run_attempt: 2 }] });
     if (url.pathname.endsWith("/jobs/1/logs")) return new Response(null, { status: 302, headers: { Location: "https://pipelines.actions.githubusercontent.com/log/1" } });
     if (url.pathname.endsWith("/compare/base...head")) return jsonResponse({ files: [{ filename: "src/cart.js", status: "modified", patch: "+unrelated();" }] });
     throw new Error(`Unexpected request ${url.href}`);
@@ -220,6 +220,10 @@ test("exact 60000-character logs are not marked truncated and job names do not b
   for (length of [60_000, 60_001]) {
     const result = await triageGitHubFailure({ owner: "acme", repo: "tiny", runId: "99" }, access);
     const source = result.evidence.sources.find((item) => item.type === "github_actions_job_log");
+    assert.equal(source.selected_run_attempt, null);
+    assert.equal(source.job_run_attempt, 2);
+    assert.equal(source.attempt_attribution, "latest_jobs_endpoint_not_independently_attempt_pinned");
+    assert.equal(result.source.workflow_run.run_attempt, null);
     assert.equal(source.character_limit_reached, length > 60_000);
     assert.equal(source.log_truncated, length > 60_000);
     assert.equal(result.source.logs_truncated, length > 60_000);
