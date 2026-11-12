@@ -7,11 +7,18 @@ The hosted server uses a server-side GitHub credential and a separate connector 
 ## Tools
 
 - **`search_codebase`** — literal, case-insensitive-by-default search in source and text files. The hosted server scans up to 30 eligible files in path order per call and reports partial scans.
-- **`list_failed_workflow_runs`** — lists recent completed failed GitHub Actions runs, optionally filtered by branch.
+- **`list_failed_workflow_runs`** — lists historical completed failed Actions runs, with branch, UTC `since`/`until`, and `page` filters. `returned_count` is the exact number of verified rows on that page, not the history total. Capped or unknown totals are `null`, with `count_accuracy` and an optional lower bound.
+- **`get_ci_status`** — latest run per listed workflow on the selected branch (default: repository default branch). Returns exact per-state counts only for the listed workflows, explicit coverage, and pagination. Disabled/no-run workflows are not passing; inspect run SHA/time before treating an older run as validation of the current branch tip.
 - **`triage_ci_failure`** — compares a supplied CI failure log or automatically fetched logs from a selected/latest failed Actions run with changed-file paths, stack traces, and available GitHub diff snippets. For fetched runs it uses a linked pull request's base/head commits, or the run commit's first parent when available. It also returns a separate `baseline` object comparing the failed head with the latest eligible older successful run of the same workflow, branch, event, and PR identity; baseline selection is capped at 100 runs and reports missing metadata, history caps, incomplete patches, and divergent/non-linear comparisons. Ranked files include bounded exact log quotes and diff snippets.
 - **`flag_intermittent_tests`** — identifies tests with both passing and failing outcomes in supplied history. Mixed outcomes are candidates, not proof of flakiness; skipped runs are excluded.
 
 The failure classification and file ranking are deterministic heuristics, not proof of cause. A direct stack-trace overlap is stronger evidence than a filename or diff-symbol match. The hosted server can retrieve logs only for failed jobs in completed failed runs; it never reruns, cancels, dispatches, or edits workflows. The local stdio tool remains credential-free and accepts supplied logs.
+
+### Accurate counts in v0.6.0
+
+GitHub's [September 2026 Actions change](https://github.blog/changelog/2026-09-25-changes-to-query-results-in-the-github-actions-api-and-ui/) caps large filtered match totals at **2,500+**. That is not an exact count, and is not evidence that every repository has 2,500 failed runs. The tool treats numeric totals at or above 2,500 conservatively as lower bounds, and supports string sentinels such as `2500+` and `2,500+`. Missing or malformed counts remain unknown, never silently zero or the page length. Smaller exact API-reported totals describe matching historical runs, not failing tests or present-day CI problems.
+
+Use `get_ci_status` for current workflow questions and `list_failed_workflow_runs` for historical investigation. A newer successful run may have resolved an older failure; `triage_ci_failure` explicitly does not establish current CI state. Failure lists also check repository identity, verify branch/conclusion, sort the returned page newest-first, and expose incomplete/mismatched results instead of accepting them as a verified count. GitHub [limits a filtered search to 1,000 returned runs](https://docs.github.com/rest/actions/workflow-runs#list-workflow-runs-for-a-repository); narrow UTC date ranges rather than extrapolating a total from one page. Calls have no cross-repository cache and never share counts between repositories.
 
 ## Hosted connector setup
 
