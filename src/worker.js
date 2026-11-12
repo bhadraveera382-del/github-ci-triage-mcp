@@ -8,6 +8,7 @@ const CLAUDE_ORIGINS = new Set([
   "https://claude.com",
   "https://platform.claude.com"
 ]);
+const CHATGPT_ORIGINS = new Set(["https://chatgpt.com"]);
 const repoPart = z.string().min(1).max(100).regex(/^[A-Za-z0-9_.-]+$/);
 const refPart = z.string().min(1).max(200).regex(/^[A-Za-z0-9._/-]+$/);
 const readOnlyAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
@@ -112,13 +113,15 @@ export function createMcpServer(access = {}) {
 export function configuredAccess(env) {
   const githubToken = typeof env.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
   const mcpToken = typeof env.MCP_ACCESS_TOKEN === "string" ? env.MCP_ACCESS_TOKEN.trim() : "";
+  const chatgptToken = typeof env.CHATGPT_MCP_ACCESS_TOKEN === "string" ? env.CHATGPT_MCP_ACCESS_TOKEN.trim() : "";
   const rawRepos = typeof env.GITHUB_ALLOWED_REPOS === "string" ? env.GITHUB_ALLOWED_REPOS.split(/[,\n]/) : [];
   const configuredRepos = rawRepos.map((value) => value.trim().toLowerCase());
   if (!githubToken || /\s/.test(githubToken) || mcpToken.length < 32 || mcpToken.length > 512 || /\s/.test(mcpToken)) return null;
+  if (chatgptToken && (chatgptToken.length < 32 || chatgptToken.length > 512 || /\s/.test(chatgptToken))) return null;
   const hasInvalidRepo = configuredRepos.some((value) => !value || (value !== "*" && !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(value)));
   const hasMixedWildcard = configuredRepos.includes("*") && (configuredRepos.length !== 1 || configuredRepos[0] !== "*");
   if (configuredRepos.length === 0 || configuredRepos.length > 10 || hasInvalidRepo || hasMixedWildcard) return null;
-  return { token: githubToken, mcpToken, allowedRepos: new Set(configuredRepos) };
+  return { token: githubToken, mcpToken, chatgptToken, allowedRepos: new Set(configuredRepos) };
 }
 
 async function tokenMatches(provided, expected) {
@@ -150,7 +153,7 @@ function originError(request) {
   }
   const sameOrigin = parsed.origin === url.origin;
   const localDevelopment = ["localhost", "127.0.0.1"].includes(url.hostname) && ["http://localhost:8787", "http://127.0.0.1:8787"].includes(parsed.origin);
-  if (!sameOrigin && !CLAUDE_ORIGINS.has(parsed.origin) && !localDevelopment) return new Response("Origin is not allowed.", { status: 403 });
+  if (!sameOrigin && !CLAUDE_ORIGINS.has(parsed.origin) && !CHATGPT_ORIGINS.has(parsed.origin) && !localDevelopment) return new Response("Origin is not allowed.", { status: 403 });
   return null;
 }
 
@@ -182,7 +185,11 @@ export default {
     const access = configuredAccess(env);
     if (!access) return withCors(Response.json({ error: "Server access is not configured." }, { status: 503 }), request);
     const match = (request.headers.get("authorization") || "").match(/^Bearer ([^\s]+)$/i);
-    if (!match || !(await tokenMatches(match[1], access.mcpToken))) {
+    const validTokens = match ? await Promise.all([
+      tokenMatches(match[1], access.mcpToken),
+      access.chatgptToken ? tokenMatches(match[1], access.chatgptToken) : false
+    ]) : [];
+    if (!validTokens.some(Boolean)) {
       return withCors(Response.json({ error: "A valid connector access key is required." }, { status: 401, headers: { "WWW-Authenticate": "Bearer realm=\"github-ci-triage\"" } }), request);
     }
 
