@@ -40,11 +40,11 @@ test("Worker accepts an authenticated MCP initialization", async () => {
   assert.equal(body.result.protocolVersion, "2025-03-26");
 });
 
-test("Worker exposes only the four read-only tools to an authenticated caller", async () => {
+test("Worker exposes only the five read-only tools to an authenticated caller", async () => {
   const response = await worker.fetch(request({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, `Bearer ${env.MCP_ACCESS_TOKEN}`), env);
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.deepEqual(body.result.tools.map((tool) => tool.name), ["search_codebase", "list_failed_workflow_runs", "triage_ci_failure", "flag_intermittent_tests"]);
+  assert.deepEqual(body.result.tools.map((tool) => tool.name), ["search_codebase", "list_failed_workflow_runs", "get_ci_status", "triage_ci_failure", "flag_intermittent_tests"]);
   assert.ok(body.result.tools.every((tool) => tool.annotations.readOnlyHint === true));
   assert.ok(body.result.tools.every((tool) => tool.annotations.destructiveHint === false));
   const triage = body.result.tools.find((tool) => tool.name === "triage_ci_failure");
