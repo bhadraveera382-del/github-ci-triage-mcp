@@ -7,6 +7,7 @@ const env = {
   MCP_ACCESS_TOKEN: "fixture-mcp-access-key-at-least-thirty-two-characters",
   GITHUB_ALLOWED_REPOS: "acme/tiny"
 };
+const chatgptEnv = { ...env, CHATGPT_MCP_ACCESS_TOKEN: "fixture-chatgpt-access-key-at-least-thirty-two-characters" };
 
 function request(payload, authorization, origin) {
   const headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
@@ -40,6 +41,15 @@ test("Worker accepts an authenticated MCP initialization", async () => {
   assert.equal(body.result.protocolVersion, "2025-03-26");
 });
 
+test("Worker accepts a separate ChatGPT key while keeping the Claude key valid", async () => {
+  const claudeResponse = await worker.fetch(request(initialize, `Bearer ${env.MCP_ACCESS_TOKEN}`), chatgptEnv);
+  const chatgptResponse = await worker.fetch(request(initialize, `Bearer ${chatgptEnv.CHATGPT_MCP_ACCESS_TOKEN}`, "https://chatgpt.com"), chatgptEnv);
+  assert.equal(claudeResponse.status, 200);
+  assert.equal(chatgptResponse.status, 200);
+  assert.equal(chatgptResponse.headers.get("Access-Control-Allow-Origin"), "https://chatgpt.com");
+  assert.equal(configuredAccess(chatgptEnv).mcpToken, env.MCP_ACCESS_TOKEN);
+});
+
 test("Worker exposes only the five read-only tools to an authenticated caller", async () => {
   const response = await worker.fetch(request({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, `Bearer ${env.MCP_ACCESS_TOKEN}`), env);
   assert.equal(response.status, 200);
@@ -71,4 +81,5 @@ test("configuredAccess accepts the sole wildcard and rejects missing or mixed wi
   assert.equal(configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "" }), null);
   assert.equal(configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "*,acme/tiny" }), null);
   assert.equal(configuredAccess({ ...env, GITHUB_ALLOWED_REPOS: "acme/tiny,*" }), null);
+  assert.equal(configuredAccess({ ...env, CHATGPT_MCP_ACCESS_TOKEN: "too-short" }), null);
 });
