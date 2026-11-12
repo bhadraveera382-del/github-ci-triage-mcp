@@ -1,3 +1,5 @@
+import { buildEvidence, classifyFailure, githubComparisonSource } from "./evidence.js";
+
 const SKIP_DIRS = new Set([
   ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
   "coverage", ".next", ".nuxt", ".venv", "venv", "__pycache__",
@@ -263,7 +265,9 @@ async function readBoundedJobLog(response) {
     text += decoder.decode();
     reader.releaseLock();
   }
-  return { text: trimFailureLog(text), truncated };
+  const boundedText = trimFailureLog(text);
+  return { text: boundedText, truncated: truncated || boundedText.length < text.length,
+    byte_limit_reached: truncated, character_limit_reached: boundedText.length < text.length };
 }
 
 async function downloadJobLog(repositoryPath, jobId, access) {
@@ -332,6 +336,11 @@ async function fetchFailedRunLog({ owner, repo, runId, branch }, access = {}) {
 
   const safeRunId = validateRunId(run.id);
   const jobsData = await githubJson(`${path}/actions/runs/${safeRunId}/jobs?filter=latest&per_page=100`, access);
+  if (!Array.isArray(jobsData.jobs)) throw new Error("GitHub returned no valid jobs list; job evidence is unavailable.");
+  for (const job of jobsData.jobs) {
+    if (job.run_id != null && String(job.run_id) !== safeRunId) throw new Error("GitHub returned a job from a different run; no log evidence was accepted.");
+    if (job.run_attempt != null && run.run_attempt != null && job.run_attempt !== run.run_attempt) throw new Error("GitHub returned jobs from a different run attempt; no log evidence was accepted.");
+  }
   const failedJobs = (Array.isArray(jobsData.jobs) ? jobsData.jobs : [])
     .filter((job) => ["failure", "timed_out", "action_required"].includes(job?.conclusion));
   if (!failedJobs.length) throw new Error("GitHub reported a failed run but no failed job was available to read.");
@@ -341,7 +350,8 @@ async function fetchFailedRunLog({ owner, repo, runId, branch }, access = {}) {
     job,
     ...await downloadJobLog(path, job.id, access)
   })));
-  const failureLog = trimFailureLog(logs.map(({ job, text }) => `Job: ${job.name}\n${text}`).join("\n\n"));
+  const joinedLog = logs.map(({ text }) => text).join("\n\n");
+  const failureLog = trimFailureLog(joinedLog);
   const pullRequest = Array.isArray(run.pull_requests)
     ? run.pull_requests.find((item) => item?.base?.sha && (item?.head?.sha || run.head_sha))
     : null;
@@ -359,8 +369,21 @@ async function fetchFailedRunLog({ owner, repo, runId, branch }, access = {}) {
       html_url: job.html_url || null,
       log_truncated: truncated
     })),
+    logDocuments: logs.map(({ job, text, truncated, byte_limit_reached, character_limit_reached }) => ({
+      id: `job:${safeRunId}:${job.id}`, type: "github_actions_job_log", text,
+      url: `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${safeRunId}/job/${encodeURIComponent(String(job.id))}`,
+      run_id: safeRunId, selected_run_attempt: run.run_attempt || 1, job_run_attempt: job.run_attempt ?? null,
+      attempt_attribution: job.run_attempt != null ? "job_metadata_matches_selected_run" : "latest_jobs_endpoint_not_independently_attempt_pinned",
+      job_id: String(job.id), job_name: job.name || "Unnamed job", workflow_id: run.workflow_id || null,
+      branch: run.head_branch || null, event: run.event || null, run_created_at: run.created_at || null,
+      selected_run_head_sha: run.head_sha || null, job_head_sha: job.head_sha || null,
+      log_truncated: truncated, byte_limit_reached, character_limit_reached,
+      line_number_scope: "bounded_job_log_excerpt_not_original_log_or_github_anchor"
+    })),
+    jobsListMayBeIncomplete: Number.isSafeInteger(jobsData.total_count) ? jobsData.total_count > (jobsData.jobs || []).length : (jobsData.jobs || []).length >= 100,
     omittedFailedJobs: Math.max(0, failedJobs.length - selectedJobs.length),
-    logsTruncated: logs.some((item) => item.truncated) || failureLog.length >= MAX_FAILURE_LOG_CHARS
+    logsTruncated: logs.some((item) => item.truncated) || failureLog.length < joinedLog.length,
+    combinedLogTruncated: failureLog.length < joinedLog.length
   };
 }
 
@@ -401,21 +424,6 @@ function extractFailureLines(log) {
     .filter((line) => /\b(?:FAIL|FAILED|ERROR|AssertionError|TypeError|SyntaxError)\b|✗|✕|×/.test(line.trim()))
     .slice(0, 12)
     .map((line) => line.trim().slice(0, 400));
-}
-
-function classifyFailure(log) {
-  const cases = [
-    [/Cannot find module|Module not found|No module named|Could not resolve/i, "import_or_dependency", "An import, module-resolution, or dependency issue is the clearest match."],
-    [/Cannot read propert(?:y|ies) of (?:null|undefined)|undefined is not|NoneType|\bTypeError\b/i, "null_or_data_shape", "A null/undefined value or unexpected data shape is implicated."],
-    [/\bAssertionError\b|Expected .{0,80}(?:received|but)|expect\(|toEqual\(|toBe\(/i, "assertion_mismatch", "A behavior or expected-value mismatch is the clearest match."],
-    [/timed?\s*out|timeout|deadline exceeded/i, "timeout", "The failure is consistent with a timeout or resource/performance limit."],
-    [/\bSyntaxError\b|parse error|unexpected token|\bTS\d{4}\b/i, "syntax_or_typecheck", "A syntax, parsing, or type-checking issue is the clearest match."],
-    [/ECONN(?:REFUSED|RESET)|network error|socket hang up|fetch failed/i, "external_service_or_network", "The failure is consistent with a network or external-service problem."]
-  ];
-  for (const [pattern, category, summary] of cases) {
-    if (pattern.test(log)) return { category, summary };
-  }
-  return { category: "unclear", summary: "The log does not match a specific failure pattern; inspect the cited failure lines and changed files." };
 }
 
 function symbolsFromLog(log) {
@@ -475,24 +483,31 @@ function scoreChangedFiles(changedFiles, references, symbols, log) {
   for (const item of changedFiles) {
     let score = 0;
     const evidence = [];
+    const matchKinds = [];
     const logQuotes = boundedLogQuotes(item.path, log, references, symbols);
     const diffSnippets = patchSnippets(item.patch, symbols);
     if (matchesReference(item.path, references)) {
       score += 100;
       evidence.push("path appears in a stack trace");
+      matchKinds.push("stack_path_overlap");
     }
     const base = item.path.split("/").at(-1).toLowerCase();
     if (base.length > 3 && log.toLowerCase().includes(base)) {
       score += 20;
       evidence.push("filename is mentioned in the failure log");
+      matchKinds.push("filename_mention");
     }
     const patch = typeof item.patch === "string" ? item.patch : "";
-    const hits = symbols.filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(patch));
+    const changedLines = patch.split(/\r?\n/).filter((line) => /^[+-]/.test(line) && !/^\+\+\+|^---/.test(line)).join("\n");
+    const hits = symbols.filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(changedLines));
     if (hits.length) {
       score += Math.min(hits.length * 8, 32);
-      evidence.push(`contains stack-frame symbol${hits.length === 1 ? "" : "s"} in the GitHub diff: ${hits.join(", ")}`);
+      evidence.push(`changed diff lines contain stack-frame symbol${hits.length === 1 ? "" : "s"}: ${hits.join(", ")}`);
+      matchKinds.push("changed_line_symbol_overlap");
     }
-    if (score > 0) scores.push({ path: item.path, status: item.status, score, evidence, log_quotes: logQuotes, diff_snippets: diffSnippets });
+    if (score > 0) scores.push({ path: item.path, status: item.status, score, evidence, match_kinds: matchKinds, matching_symbols: hits,
+      score_interpretation: "heuristic_ranking_points_not_probability", log_quotes: logQuotes, diff_snippets: diffSnippets,
+      log_quote_line_number_scope: "combined_analyzed_excerpt_not_original_log", legacy_snippets_may_be_truncated: true });
   }
   scores.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
   return scores.slice(0, 15);
@@ -605,14 +620,17 @@ function sameBaselineRun(candidate, failedRun, failedPrIdentity, failedTimestamp
 }
 
 function comparisonFiles(data) {
+  if (!Array.isArray(data?.files) || data.files.some((file) => typeof file?.filename !== "string" || !file.filename)) {
+    throw new Error("GitHub returned no valid changed-file list; comparison evidence is unavailable, not an empty change.");
+  }
   return (Array.isArray(data?.files) ? data.files : []).map((file) => ({
     status: file.status === "renamed" ? "R" : file.status === "added" ? "A" : file.status === "removed" ? "D" : "M",
     path: normalizeRelative(file.filename),
-    patch: file.patch || ""
+    patch: typeof file.patch === "string" ? file.patch : ""
   }));
 }
 
-async function findSuccessfulBaseline({ failedRun, repositoryPath, access }) {
+async function findSuccessfulBaseline({ failedRun, repositoryPath, access, owner, repo }) {
   const metadata = { workflow_id: failedRun.workflow_id, branch: failedRun.head_branch || null, event: failedRun.event || null, pull_request: pullRequestIdentity(failedRun) };
   const failedTimestamp = runTimestamp(failedRun.created_at);
   if (!failedRun.workflow_id || !failedRun.head_branch || !failedRun.event || failedTimestamp === null) {
@@ -622,6 +640,7 @@ async function findSuccessfulBaseline({ failedRun, repositoryPath, access }) {
   const workflowPath = `${repositoryPath}/actions/workflows/${encodeURIComponent(String(failedRun.workflow_id))}/runs`;
   const result = await githubJson(`${workflowPath}?${query}`, access);
   const runs = Array.isArray(result.workflow_runs) ? result.workflow_runs : [];
+  for (const candidate of runs) assertRunRepository(candidate, owner, repo);
   const failedPrIdentity = pullRequestIdentity(failedRun);
   const eligible = runs.filter((candidate) => sameBaselineRun(candidate, failedRun, failedPrIdentity, failedTimestamp));
   eligible.sort((a, b) => runTimestamp(b.created_at) - runTimestamp(a.created_at));
@@ -632,7 +651,7 @@ async function findSuccessfulBaseline({ failedRun, repositoryPath, access }) {
   return { status: "selected", run: summarizeWorkflowRun(baseline), rawRun: baseline, metadata, search_capped: searchCapped };
 }
 
-async function compareBaseline({ baseline, failedRun, repositoryPath, access, failureLog, references, symbols }) {
+async function compareBaseline({ baseline, failedRun, repositoryPath, access, failureLog, references, symbols, owner, repo, documents, failure }) {
   if (baseline.status !== "selected") return baseline;
   const baselineHead = selectedPullRequestHeadSha(baseline.rawRun) || baseline.rawRun.head_sha;
   const failedHead = selectedPullRequestHeadSha(failedRun) || failedRun.head_sha;
@@ -658,6 +677,9 @@ async function compareBaseline({ baseline, failedRun, repositoryPath, access, fa
     patches_incomplete: missingPatchFiles.length > 0,
     missing_patch_files: missingPatchFiles,
     comparison_file_list_capped: comparisonFileListCapped,
+    ...buildEvidence({ scope: "baseline", documents, changedFiles: files, rankedFiles: ranked, failure,
+      comparisonSource: githubComparisonSource({ scope: "baseline", owner, repo, base: baselineHead, head: failedHead, data: comparisonData,
+        basis: "selected_older_success_same_workflow_branch_event_and_available_pr_identity" }) }),
     note: "Baseline compares the selected older successful run head to the failed run head; it is a heuristic reference, not proof of causation."
   };
 }
@@ -692,17 +714,20 @@ export async function triageGitHubFailure({ owner, repo, failureLog, runId, bran
   const likelyChangedFiles = scoreChangedFiles(allChangedFiles, references, symbols, log);
   const failure = classifyFailure(log);
   const failureLines = extractFailureLines(log);
-  const directFileMatches = likelyChangedFiles.filter((item) => item.evidence.includes("path appears in a stack trace"));
+  const documents = fetched ? fetched.logDocuments : [{ id: "provided_log", type: "caller_supplied_log", text: log,
+    url: null, authenticity: "not_independently_verified", log_truncated: false,
+    line_number_scope: "caller_supplied_excerpt_not_original_ci_log" }];
+  const directFileMatches = likelyChangedFiles.filter((item) => item.match_kinds.includes("stack_path_overlap"));
   const baseline = fetched
-    ? await compareBaseline({ baseline: await findSuccessfulBaseline({ failedRun: fetched.run, repositoryPath: path, access }), failedRun: fetched.run, repositoryPath: path, access, failureLog: log, references, symbols })
+    ? await compareBaseline({ baseline: await findSuccessfulBaseline({ failedRun: fetched.run, repositoryPath: path, access, owner, repo }), failedRun: fetched.run, repositoryPath: path, access, failureLog: log, references, symbols, owner, repo, documents, failure })
     : { status: "not_applicable", reason: "provided_log_mode" };
   let summary;
   if (likelyChangedFiles.length) {
     summary = `${failure.summary} ${directFileMatches.length ? "Stack-trace paths overlap the changed files." : "Changed-file names or GitHub diff snippets provide a possible connection."}`;
   } else if (allChangedFiles.length) {
-    summary = `${failure.summary} No changed file has a direct stack-trace or diff-symbol match, so the connection to this change is weak.`;
+    summary = `${failure.summary} No overlap was found in the inspected path, filename, or changed-line-symbol evidence; incomplete evidence may hide a connection.`;
   } else {
-    summary = `${failure.summary} GitHub reported no changed files for ${base}...${head}.`;
+    summary = `${failure.summary} The compare response returned no file entries for ${base}...${head}; this is not a root-cause finding.`;
   }
   return {
     repository: `${owner}/${repo}`,
@@ -717,6 +742,19 @@ export async function triageGitHubFailure({ owner, repo, failureLog, runId, bran
     likely_related_changed_files: likelyChangedFiles,
     stack_trace_files: references,
     failure_evidence: failureLines,
+    ...buildEvidence({ documents, changedFiles: allChangedFiles, rankedFiles: likelyChangedFiles, failure,
+      comparisonSource: githubComparisonSource({ owner, repo, base, head, data: comparisonData,
+        basis: baseRef && headRef ? "caller_provided_refs" : fetched?.baseRef ? "linked_pull_request_base_and_head" : "failed_run_first_parent_and_head" }) }),
+    analysis_coverage: {
+      changed_file_count_scope: "files_returned_by_compare_api_not_guaranteed_total", comparison_file_list_may_be_capped: allChangedFiles.length >= 300,
+      missing_patch_files: allChangedFiles.filter((file) => !file.patch).map((file) => file.path),
+      patches_incomplete: allChangedFiles.some((file) => !file.patch),
+      log_comparison_head_attribution: suppliedLog ? "caller_supplied_log_not_linked_to_a_verified_run" : baseRef && headRef ? "caller_provided_refs_not_verified_against_selected_run_head" : "inferred_from_selected_run_metadata",
+      combined_log_truncated: fetched?.combinedLogTruncated || false,
+      ranking_log_scope: "combined_analyzed_excerpt", evidence_quote_scope: "bounded_source_excerpts",
+      extraction_limits: { stack_references: 40, stack_symbols: 20, legacy_failure_lines: 12, ranked_files: 15, quotes_per_file_per_kind: 3, classification_quotes_per_pattern: 3 },
+      negative_result_meaning: "No match found in inspected evidence, not proof no related change exists; omitted logs, files, patches, and extraction limits can hide signals."
+    },
     baseline,
     source: fetched ? {
       type: "github_actions",
@@ -724,7 +762,10 @@ export async function triageGitHubFailure({ owner, repo, failureLog, runId, bran
       failed_job_count: fetched.failedJobCount,
       failed_jobs: fetched.failedJobs,
       omitted_failed_jobs: fetched.omittedFailedJobs,
-      logs_truncated: fetched.logsTruncated
+      logs_truncated: fetched.logsTruncated,
+      jobs_list_may_be_incomplete: fetched.jobsListMayBeIncomplete,
+      failed_job_count_scope: "failed_jobs_observed_on_first_jobs_page",
+      job_selection_policy: "first_five_failed_jobs_in_api_order"
     } : { type: "provided_log" },
     limitations: [
       "This is deterministic, evidence-based triage—not an LLM diagnosis or proof of causation.",

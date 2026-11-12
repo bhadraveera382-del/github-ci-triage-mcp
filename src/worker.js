@@ -33,7 +33,7 @@ function registerTool(server, name, config, handler) {
 }
 
 export function createMcpServer(access = {}) {
-  const server = new McpServer({ name: "github-ci-triage", version: "0.6.0" });
+  const server = new McpServer({ name: "github-ci-triage", version: "0.7.0" });
 
   registerTool(server, "search_codebase", {
     title: "Search allowed GitHub code",
@@ -79,7 +79,7 @@ export function createMcpServer(access = {}) {
 
   registerTool(server, "triage_ci_failure", {
     title: "Triage GitHub Actions failure",
-    description: "Read-only triage using a supplied failure log or automatically fetched logs from a selected failed run (run_id) or the latest completed failed run. Provide both base_ref and head_ref for a supplied log; automatic mode uses the run's pull request base or commit parent when available and separately compares it with the latest eligible older successful run of the same workflow, branch, event, and PR. Never reruns or changes workflows.",
+    description: "Read-only evidence-backed triage from a supplied log or selected/latest completed failed Actions run. diagnostic_claims link evidence_ids to evidence.items and evidence.sources, including job/compare URLs, quote locators, refs, truncation and missing-patch coverage. Cite those sources and IDs. Pattern labels and file rankings are hypotheses, not root-cause findings; scores are not probabilities. Excerpt line numbers are not original GitHub log anchors. Provide both base_ref and head_ref with a supplied log; automatic mode uses PR base/head or commit parent and separately compares an eligible older same-workflow/branch/event/PR success. Respect incomplete evidence; do not infer current CI health or causation. Never reruns or changes workflows.",
     annotations: readOnlyAnnotations,
     inputSchema: {
       owner: repoPart.describe("GitHub user or organization that owns the repository."),
@@ -176,7 +176,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed.", { status: 405, headers: { Allow: "GET, HEAD" } });
-      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.6.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
+      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.7.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
     }
     if (url.pathname !== "/mcp") return new Response("Not found.", { status: 404 });
     if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), request);

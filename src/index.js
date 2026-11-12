@@ -5,7 +5,7 @@ import { flagIntermittentTests, searchCode, triageFailure } from "./core.js";
 
 const server = new McpServer({
   name: "github-ci-triage",
-  version: "0.1.0"
+  version: "0.7.0"
 });
 
 function textResult(value) {
@@ -36,7 +36,7 @@ server.registerTool("search_codebase", {
 
 server.registerTool("triage_ci_failure", {
   title: "Triage CI failure",
-  description: "Compare a supplied CI failure log with changed files in a local Git checkout. Optionally provide base_ref and head_ref to compare a commit range. Does not contact GitHub or any CI service.",
+  description: "Compare a supplied CI failure log with changed files in a local Git checkout and return an evidence ledger with diagnostic claims. Optionally provide base_ref and head_ref to compare a commit range. Does not contact GitHub or any CI service.",
   inputSchema: {
     repo_path: z.string().optional().describe("Path to a local Git checkout. Optional when TRIAGE_REPO_ROOT is configured."),
     failure_log: z.string().min(1).max(60_000).describe("Relevant failing job log excerpt, pasted or copied from CI."),

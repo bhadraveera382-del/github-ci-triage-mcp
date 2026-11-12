@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { buildEvidence, classifyFailure } from "./evidence.js";
 
 const SKIP_DIRS = new Set([
   ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
@@ -184,21 +185,6 @@ function extractFailureLines(log) {
   return candidates.slice(0, 12).map((line) => line.trim().slice(0, 400));
 }
 
-function classifyFailure(log) {
-  const cases = [
-    [/Cannot find module|Module not found|No module named|Could not resolve/i, "import_or_dependency", "An import, module-resolution, or dependency issue is the clearest match."],
-    [/Cannot read propert(?:y|ies) of (?:null|undefined)|undefined is not|NoneType|\bTypeError\b/i, "null_or_data_shape", "A null/undefined value or unexpected data shape is implicated."],
-    [/\bAssertionError\b|Expected .{0,80}(?:received|but)|expect\(|toEqual\(|toBe\(/i, "assertion_mismatch", "A behavior or expected-value mismatch is the clearest match."],
-    [/timed?\s*out|timeout|deadline exceeded/i, "timeout", "The failure is consistent with a timeout or resource/performance limit."],
-    [/\bSyntaxError\b|parse error|unexpected token|\bTS\d{4}\b/i, "syntax_or_typecheck", "A syntax, parsing, or type-checking issue is the clearest match."],
-    [/ECONN(?:REFUSED|RESET)|network error|socket hang up|fetch failed/i, "external_service_or_network", "The failure is consistent with a network or external-service problem."]
-  ];
-  for (const [pattern, category, summary] of cases) {
-    if (pattern.test(log)) return { category, summary };
-  }
-  return { category: "unclear", summary: "The log does not match a specific failure pattern; inspect the cited failure lines and changed files." };
-}
-
 function symbolsFromLog(log) {
   const symbols = new Set();
   for (const line of log.split(/\r?\n/)) {
@@ -219,41 +205,63 @@ function matchesReference(changedPath, references) {
   });
 }
 
-async function scoreChangedFiles(workspace, changedFiles, references, symbols, log) {
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function changedPatchLines(patch) {
+  return String(patch || "").split(/\r?\n/).filter((line) => /^[+-]/.test(line) && !/^\+\+\+|^---/.test(line));
+}
+
+function scoreChangedFiles(changedFiles, references, symbols, log) {
   const scores = [];
   for (const item of changedFiles) {
-    const relative = item.path;
     let score = 0;
     const evidence = [];
-    if (matchesReference(relative, references)) {
+    const matchKinds = [];
+    if (matchesReference(item.path, references)) {
       score += 100;
       evidence.push("path appears in a stack trace");
+      matchKinds.push("stack_path_overlap");
     }
-    const base = path.basename(relative).toLocaleLowerCase();
+    const base = path.basename(item.path).toLocaleLowerCase();
     if (base.length > 3 && log.toLocaleLowerCase().includes(base)) {
       score += 20;
       evidence.push("filename is mentioned in the failure log");
+      matchKinds.push("filename_mention");
     }
-    const absolute = path.join(workspace, ...relative.split("/"));
-    try {
-      const realFile = await fs.realpath(absolute);
-      if (!isInside(workspace, realFile)) continue;
-      const stat = await fs.stat(realFile);
-      if (!stat.isFile() || stat.size > MAX_FILE_BYTES) continue;
-      const content = await fs.readFile(realFile, "utf8");
-      if (content.includes("\u0000")) continue;
-      const hits = symbols.filter((symbol) => new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(content));
-      if (hits.length) {
-        score += Math.min(hits.length * 8, 32);
-        evidence.push(`contains stack-frame symbol${hits.length === 1 ? "" : "s"}: ${hits.join(", ")}`);
-      }
-    } catch {
-      // Deleted or unreadable changed paths remain listed without content inspection.
+    const changedLines = changedPatchLines(item.patch).join("\n");
+    const hits = symbols.filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(changedLines));
+    if (hits.length) {
+      score += Math.min(hits.length * 8, 32);
+      evidence.push(`changed diff lines contain stack-frame symbol${hits.length === 1 ? "" : "s"}: ${hits.join(", ")}`);
+      matchKinds.push("changed_line_symbol_overlap");
     }
-    if (score > 0) scores.push({ path: relative, status: item.status, score, evidence });
+    if (score > 0) scores.push({
+      path: item.path, status: item.status, score, evidence, match_kinds: matchKinds,
+      matching_symbols: hits, score_interpretation: "heuristic_ranking_points_not_probability",
+      log_quotes: [], diff_snippets: changedPatchLines(item.patch).filter((line) => hits.some((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line))).slice(0, 3),
+      log_quote_line_number_scope: "combined_analyzed_excerpt_not_original_log", legacy_snippets_may_be_truncated: true
+    });
   }
   scores.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
   return scores.slice(0, 15);
+}
+
+function parsePatchByPath(text) {
+  const patches = new Map();
+  let unmappable = false;
+  const sections = String(text || "").split(/^diff --git /m).slice(1);
+  for (const section of sections) {
+    const header = section.split(/\r?\n/, 1)[0];
+    const match = header.match(/^a\/(.+) b\/(.+)$/);
+    if (!match || match[1] !== match[2] || /["\\]/.test(match[1])) {
+      unmappable = true;
+      continue;
+    }
+    patches.set(normalizeRelative(match[1]), `diff --git ${section}`.trimEnd());
+  }
+  return { patches, unmappable };
 }
 
 function parseNameStatus(text) {
@@ -279,32 +287,47 @@ export async function triageFailure({ repoPath, failureLog, baseRef, headRef }) 
   if (!isGitRepository) throw new Error("triage_ci_failure requires a local Git checkout.");
 
   let changedText;
+  let patchText;
   let comparison;
+  let comparisonRefs;
   if (baseRef && headRef) {
     const base = validateRef(baseRef, "base_ref");
     const head = validateRef(headRef, "head_ref");
-    const result = runGit(["-C", workspace, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", `${base}...${head}`, "--"]);
-    changedText = result.stdout;
+    comparisonRefs = { base, head };
     comparison = `${base}...${head}`;
-  } else {
-    const result = runGit(["-C", workspace, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "HEAD", "--"]);
+    const result = runGit(["-C", workspace, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", comparison, "--"]);
     changedText = result.stdout;
+    patchText = runGit(["-C", workspace, "diff", "--no-ext-diff", "--no-textconv", "--find-renames", comparison, "--"]).stdout;
+  } else {
     comparison = "working tree vs HEAD";
+    comparisonRefs = { base: "HEAD", head: "working-tree" };
+    const result = runGit(["-C", workspace, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", "HEAD", "--"]);
+    changedText = result.stdout;
+    patchText = runGit(["-C", workspace, "diff", "--no-ext-diff", "--no-textconv", "--find-renames", "HEAD", "--"]).stdout;
   }
 
   const changedFiles = parseNameStatus(changedText);
+  const patchInfo = parsePatchByPath(patchText);
+  for (const file of changedFiles) file.patch = patchInfo.patches.get(file.path) || "";
   const references = extractFileReferences(log);
   const symbols = symbolsFromLog(log);
-  const likelyChangedFiles = await scoreChangedFiles(workspace, changedFiles, references, symbols, log);
+  const likelyChangedFiles = scoreChangedFiles(changedFiles, references, symbols, log);
   const failure = classifyFailure(log);
   const failureLines = extractFailureLines(log);
-  const directFileMatches = likelyChangedFiles.filter((item) => item.evidence.includes("path appears in a stack trace"));
+  const directFileMatches = likelyChangedFiles.filter((item) => item.match_kinds.includes("stack_path_overlap"));
+  const callerDocument = { id: "provided_log", type: "caller_supplied_log", text: log, url: null,
+    authenticity: "not_independently_verified", line_number_scope: "caller_supplied_excerpt_not_original_ci_log" };
+  const comparisonSource = { id: "local:comparison", type: "local_git_diff", repository: path.basename(workspace), url: null,
+    requested_base_ref: comparisonRefs.base, requested_head_ref: comparisonRefs.head, comparison,
+    scope: comparison === "working tree vs HEAD" ? "working_tree_vs_refs" : "refs_comparison",
+    no_ext_diff: true, no_textconv: true, patches_incomplete: patchInfo.unmappable || changedFiles.some((file) => !file.patch),
+    note: "Local Git diff is bounded and read-only; ambiguous or unmappable patches are not used as symbol evidence." };
 
   let summary;
   if (likelyChangedFiles.length) {
-    summary = `${failure.summary} ${directFileMatches.length ? "Stack-trace paths overlap the changed files." : "Changed files contain symbols named in the failure stack, or their filenames appear in the log."}`;
+    summary = `${failure.summary} ${directFileMatches.length ? "Stack-trace paths overlap the changed files." : "Added/removed diff lines contain stack-frame symbols, or changed-file names appear in the log."}`;
   } else if (changedFiles.length) {
-    summary = `${failure.summary} No changed file has a direct stack-trace or symbol match, so the connection to this change is weak.`;
+    summary = `${failure.summary} No overlap was found in inspected evidence; incomplete or unmappable patches may hide a connection.`;
   } else {
     summary = `${failure.summary} No changed files were found for ${comparison}; supply base_ref and head_ref for the CI commit range if needed.`;
   }
@@ -315,13 +338,23 @@ export async function triageFailure({ repoPath, failureLog, baseRef, headRef }) 
     failure_category: failure.category,
     summary,
     changed_file_count: changedFiles.length,
-    changed_files: changedFiles.slice(0, 100),
+    changed_files: changedFiles.slice(0, 100).map(({ status, path: filePath }) => ({ status, path: filePath })),
     likely_related_changed_files: likelyChangedFiles,
     stack_trace_files: references,
     failure_evidence: failureLines,
+    ...buildEvidence({ scope: "local", documents: [callerDocument], comparisonSource,
+      changedFiles, rankedFiles: likelyChangedFiles, failure }),
+    analysis_coverage: {
+      changed_file_count_scope: "files returned by local Git name-status",
+      patches_incomplete: comparisonSource.patches_incomplete,
+      ranking_log_scope: "caller_supplied_excerpt",
+      extraction_limits: { stack_references: 40, stack_symbols: 20, legacy_failure_lines: 12, ranked_files: 15, quotes_per_file_per_kind: 3, classification_quotes_per_pattern: 3 },
+      negative_result_meaning: "No match found in inspected evidence, not proof no related change exists; omitted or unmappable patches can hide signals."
+    },
     limitations: [
       "This is deterministic, evidence-based triage—not an LLM diagnosis or proof of causation.",
-      "Only the supplied CI log and local Git checkout are inspected; no GitHub API, CI service, or network is contacted."
+      "Only the supplied CI log and local Git checkout are inspected; no GitHub API, CI service, or network is contacted.",
+      "Unmappable, omitted, or bounded Git patches are not scored as changed-line symbol evidence."
     ]
   };
 }
