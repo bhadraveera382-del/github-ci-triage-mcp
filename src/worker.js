@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
-import { flagIntermittentTests, listFailedWorkflowRuns, searchGitHubCode, triageGitHubFailure } from "./remote-core.js";
+import { flagIntermittentTests, getCIStatus, listFailedWorkflowRuns, searchGitHubCode, triageGitHubFailure } from "./remote-core.js";
 
 const CLAUDE_ORIGINS = new Set([
   "https://claude.ai",
@@ -32,7 +32,7 @@ function registerTool(server, name, config, handler) {
 }
 
 export function createMcpServer(access = {}) {
-  const server = new McpServer({ name: "github-ci-triage", version: "0.5.0" });
+  const server = new McpServer({ name: "github-ci-triage", version: "0.6.0" });
 
   registerTool(server, "search_codebase", {
     title: "Search allowed GitHub code",
@@ -50,15 +50,31 @@ export function createMcpServer(access = {}) {
 
   registerTool(server, "list_failed_workflow_runs", {
     title: "List failed GitHub Actions runs",
-    description: "Read-only listing of recent completed failed workflow runs for a repository accessible to this connector. Supports an optional branch filter; never reruns or changes a workflow.",
+    description: "Read-only historical failed runs, NOT current CI health or failing-test counts. returned_count is the exact number of verified rows on this page. total_count is null for capped/unknown API totals; a 2,500+ lower bound must NEVER be reported as exactly 2,500 failures. Supports branch, UTC date range and pagination (GitHub filtered searches cap at 1,000 rows). Use get_ci_status for latest workflow state. Never reruns or changes workflows.",
     annotations: readOnlyAnnotations,
     inputSchema: {
       owner: repoPart.describe("GitHub user or organization that owns the repository."),
       repo: repoPart.describe("Repository name accessible to this connector."),
       branch: refPart.optional().describe("Optional branch name to filter failed runs."),
-      limit: z.number().int().min(1).max(25).default(10).describe("Maximum number of recent failed runs to return.")
+      limit: z.number().int().min(1).max(25).default(10).describe("Maximum verified failed rows returned on one page, not the total history count."),
+      page: z.number().int().min(1).max(1000).default(1).describe("Page number; page × limit must not exceed 1,000. Narrow date filters for older history."),
+      since: z.string().max(30).optional().describe("Inclusive UTC date or timestamp, e.g. 2026-11-01 or 2026-11-01T00:00:00Z."),
+      until: z.string().max(30).optional().describe("Inclusive UTC date or timestamp upper bound.")
     }
-  }, ({ owner, repo, branch, limit }) => listFailedWorkflowRuns({ owner, repo, branch, limit }, access));
+  }, (args) => listFailedWorkflowRuns(args, access));
+
+  registerTool(server, "get_ci_status", {
+    title: "Get current GitHub Actions workflow state",
+    description: "Read-only latest run per workflow on a selected branch (default: repository default branch). Use this for current CI questions instead of historical failure totals. Reports exact counts only for listed workflows, with coverage and pagination; disabled/no-run workflows are not passing, and a run may be older than the current branch tip. Never triggers or edits workflows.",
+    annotations: readOnlyAnnotations,
+    inputSchema: {
+      owner: repoPart,
+      repo: repoPart,
+      branch: refPart.optional(),
+      page: z.number().int().min(1).max(1000).default(1),
+      limit: z.number().int().min(1).max(20).default(20)
+    }
+  }, (args) => getCIStatus(args, access));
 
   registerTool(server, "triage_ci_failure", {
     title: "Triage GitHub Actions failure",
@@ -157,7 +173,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed.", { status: 405, headers: { Allow: "GET, HEAD" } });
-      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.5.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
+      return withCors(Response.json({ status: "ok", name: "github-ci-triage", version: "0.6.0", mcp_endpoint: "/mcp", ready: Boolean(configuredAccess(env)), read_only: true }), request);
     }
     if (url.pathname !== "/mcp") return new Response("Not found.", { status: 404 });
     if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), request);

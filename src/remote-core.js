@@ -101,19 +101,131 @@ function summarizeWorkflowRun(run) {
   };
 }
 
-export async function listFailedWorkflowRuns({ owner, repo, branch, limit = 10 } = {}, access = {}) {
-  await requireRepo(owner, repo, access);
+// Large filtered Actions searches can report 2,500+ instead of an exact total.
+// Never coerce that sentinel into either 2,500 exact failures or a page length.
+function workflowCount(raw, incomplete = false) {
+  const text = typeof raw === "string" ? raw.replaceAll(",", "").trim() : "";
+  const capped = text.match(/^(\d+)\+$/);
+  const number = typeof raw === "number" ? raw : (/^\d+$/.test(text) ? Number(text) : NaN);
+  if (capped || (Number.isSafeInteger(number) && number >= 2500)) {
+    return { total_count: null, count_accuracy: "lower_bound", total_count_lower_bound: capped ? Number(capped[1]) : number };
+  }
+  if (!incomplete && Number.isSafeInteger(number) && number >= 0) {
+    return { total_count: number, count_accuracy: "api_reported_exact", total_count_lower_bound: null };
+  }
+  return { total_count: null, count_accuracy: "unknown", total_count_lower_bound: null };
+}
+
+function assertRunRepository(run, owner, repo) {
+  const returnedRepo = run?.repository?.full_name;
+  if (returnedRepo && returnedRepo.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) {
+    throw new Error("GitHub returned a workflow run for a different repository; no result was accepted.");
+  }
+}
+
+function newestRuns(runs) {
+  return [...runs].sort((a, b) => (runTimestamp(b.created_at) ?? 0) - (runTimestamp(a.created_at) ?? 0)
+    || String(b.id).length - String(a.id).length || String(b.id).localeCompare(String(a.id)));
+}
+
+function dateFilter(since, until) {
+  const validate = (value, label) => {
+    if (value === undefined) return null;
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/.test(value) || !Number.isFinite(Date.parse(value))) {
+      throw new Error(`${label} must be a UTC ISO date or timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ssZ).`);
+    }
+    // Reject normalized invalid calendar dates such as February 30.
+    if (new Date(value).toISOString().slice(0, 10) !== value.slice(0, 10)) throw new Error(`${label} is not a valid calendar date.`);
+    return value;
+  };
+  const start = validate(since, "since");
+  const end = validate(until, "until");
+  if (start && end && Date.parse(start) > Date.parse(end)) throw new Error("since must not be later than until.");
+  return start && end ? `${start}..${end}` : start ? `>=${start}` : end ? `<=${end}` : null;
+}
+
+export async function listFailedWorkflowRuns({ owner, repo, branch, limit = 10, page = 1, since, until } = {}, access = {}) {
+  const created = dateFilter(since, until);
   if (branch) validateRef(branch, "branch");
-  const safeLimit = Math.max(1, Math.min(Number(limit) || 10, MAX_FAILED_RUNS));
-  const query = new URLSearchParams({ status: "failure", per_page: String(safeLimit) });
+  const safeLimit = Math.max(1, Math.min(Math.trunc(Number(limit) || 10), MAX_FAILED_RUNS));
+  const safePage = Number(page);
+  if (!Number.isInteger(safePage) || safePage < 1 || safePage * safeLimit > 1000) throw new Error("page and limit must select within GitHub's 1,000-result filtered-search limit; narrow since/until for older history.");
+  await requireRepo(owner, repo, access);
+  const query = new URLSearchParams({ status: "failure", per_page: String(safeLimit), page: String(safePage) });
   if (branch) query.set("branch", branch);
+  if (created) query.set("created", created);
   const result = await githubJson(`${repoPath(owner, repo)}/actions/runs?${query}`, access);
-  const runs = Array.isArray(result.workflow_runs) ? result.workflow_runs : [];
+  if (!Array.isArray(result.workflow_runs)) throw new Error("GitHub returned an invalid workflow-run list; no count was accepted.");
+  for (const run of result.workflow_runs) assertRunRepository(run, owner, repo);
+  const startTime = since ? Date.parse(since) : null;
+  const endTime = until ? Date.parse(until.length === 10 ? `${until}T23:59:59.999Z` : until) : null;
+  const matches = result.workflow_runs.filter((run) => {
+    const timestamp = runTimestamp(run?.created_at);
+    return run?.status === "completed" && run?.conclusion === "failure" && (!branch || run.head_branch === branch)
+      && (startTime === null || (timestamp !== null && timestamp >= startTime))
+      && (endTime === null || (timestamp !== null && timestamp <= endTime));
+  });
+  const end = (safePage - 1) * safeLimit + result.workflow_runs.length;
+  const reported = workflowCount(result.total_count, result.incomplete_results === true);
+  const inconsistent = matches.length !== result.workflow_runs.length || (matches.length > 0 && reported.total_count !== null && reported.total_count < end);
+  const counts = inconsistent ? { total_count: null, count_accuracy: "unknown", total_count_lower_bound: null } : reported;
+  const runs = newestRuns(matches).slice(0, safeLimit).map(summarizeWorkflowRun);
+  const more = counts.count_accuracy === "lower_bound" || (counts.total_count !== null ? counts.total_count > end : result.workflow_runs.length >= safeLimit);
   return {
     repository: `${owner}/${repo}`,
-    total_count: Number(result.total_count) || runs.length,
-    runs: runs.filter((run) => run?.status === "completed" && run?.conclusion === "failure").map(summarizeWorkflowRun),
-    results_truncated: (Number(result.total_count) || 0) > runs.length
+    filters: { conclusion: "failure", branch: branch || null, since: since || null, until: until || null },
+    page: safePage,
+    page_size: safeLimit,
+    ...counts,
+    returned_count: runs.length,
+    runs,
+    results_truncated: safePage > 1 || more || inconsistent,
+    has_more: more,
+    next_page: more && (safePage + 1) * safeLimit <= 1000 ? safePage + 1 : null,
+    excluded_unexpected_runs: result.workflow_runs.length - matches.length,
+    count_scope: "Historical failed workflow runs matching these filters, not failing tests, current CI problems, or runs inspected in detail.",
+    note: counts.count_accuracy === "lower_bound"
+      ? "GitHub's large-search count is a lower bound, not an exact total. Narrow since/until to obtain smaller counts. Only returned_count is the exact number of verified failures on this page."
+      : "Only returned_count is the exact number of verified failures on this page. Historical failures may have been fixed by newer runs; use get_ci_status for current workflow state."
+  };
+}
+
+export async function getCIStatus({ owner, repo, branch, page = 1, limit = 20 } = {}, access = {}) {
+  const info = await requireRepo(owner, repo, access);
+  const selectedBranch = validateRef(branch || info.default_branch, "branch");
+  if (!Number.isInteger(page) || page < 1 || page > 1000 || !Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("page must be 1–1000 and limit must be 1–20.");
+  const path = repoPath(owner, repo);
+  const data = await githubJson(`${path}/actions/workflows?per_page=${limit}&page=${page}`, access);
+  if (!Array.isArray(data.workflows)) throw new Error("GitHub returned an invalid workflow list; current CI state is unknown.");
+  if (data.workflows.length > limit) throw new Error("GitHub returned more workflows than requested; no partial current state was accepted.");
+  const workflows = [];
+  // Bound fan-out below the Worker's subrequest limit; no history total is used.
+  for (let offset = 0; offset < data.workflows.length; offset += 4) {
+    const batch = await Promise.all(data.workflows.slice(offset, offset + 4).map(async (workflow) => {
+      const row = { workflow_id: workflow.id, name: workflow.name, path: workflow.path, workflow_state: workflow.state };
+      if (workflow.state !== "active") return { ...row, current_state: "disabled", latest_run: null };
+      const query = new URLSearchParams({ branch: selectedBranch, per_page: "1" });
+      const result = await githubJson(`${path}/actions/workflows/${encodeURIComponent(String(workflow.id))}/runs?${query}`, access);
+      if (!Array.isArray(result.workflow_runs)) throw new Error("GitHub returned an invalid current workflow-run list.");
+      for (const run of result.workflow_runs) {
+        assertRunRepository(run, owner, repo);
+        if (String(run.workflow_id) !== String(workflow.id) || run.head_branch !== selectedBranch) throw new Error("GitHub returned a run outside the requested workflow or branch; current state was not accepted.");
+      }
+      const run = newestRuns(result.workflow_runs)[0];
+      return { ...row, current_state: run ? (run.status === "completed" ? run.conclusion || "unknown" : run.status || "unknown") : "no_runs_on_branch", latest_run: run ? summarizeWorkflowRun(run) : null };
+    }));
+    workflows.push(...batch);
+  }
+  const knownTotal = Number.isSafeInteger(data.total_count) && data.total_count >= workflows.length ? data.total_count : null;
+  const hasMore = knownTotal === null ? data.workflows.length >= limit : page * limit < knownTotal;
+  const counts = {};
+  for (const workflow of workflows) counts[workflow.current_state] = (counts[workflow.current_state] || 0) + 1;
+  return {
+    repository: `${owner}/${repo}`, branch: selectedBranch, observed_at: new Date().toISOString(),
+    workflows, returned_workflow_count: workflows.length, current_state_counts: counts,
+    page, page_size: limit, has_more: hasMore, next_page: hasMore ? page + 1 : null,
+    coverage_complete: page === 1 && !hasMore,
+    note: "Latest run per listed workflow on the selected branch, not historical failure totals. Disabled workflows and workflows with no runs are not passing. A latest run can be older than the branch tip; inspect head_sha and created_at before treating it as validation of current code. No workflow was triggered or changed."
   };
 }
 
@@ -208,10 +320,12 @@ async function fetchFailedRunLog({ owner, repo, runId, branch }, access = {}) {
     const query = new URLSearchParams({ status: "failure", per_page: "10" });
     if (branch) query.set("branch", branch);
     const result = await githubJson(`${path}/actions/runs?${query}`, access);
-    run = (Array.isArray(result.workflow_runs) ? result.workflow_runs : [])
-      .find((item) => item?.status === "completed" && item?.conclusion === "failure");
+    const candidates = Array.isArray(result.workflow_runs) ? result.workflow_runs : [];
+    for (const candidate of candidates) assertRunRepository(candidate, owner, repo);
+    run = newestRuns(candidates.filter((item) => item?.status === "completed" && item?.conclusion === "failure" && (!branch || item.head_branch === branch)))[0];
     if (!run) throw new Error("No completed failed GitHub Actions run was found for this repository and branch.");
   }
+  assertRunRepository(run, owner, repo);
   if (run.status !== "completed" || run.conclusion !== "failure") {
     throw new Error("The selected GitHub Actions run is not a completed failure; no logs were fetched.");
   }
@@ -253,6 +367,7 @@ async function fetchFailedRunLog({ owner, repo, runId, branch }, access = {}) {
 async function requireRepo(owner, repo, access) {
   enforceRepositoryAccess(owner, repo, access);
   const info = await githubJson(repoPath(owner, repo), access);
+  if (info.full_name && info.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) throw new Error("GitHub returned a different repository than requested; no data was accepted.");
   if (!access.token && info.private !== false) {
     throw new Error("Private repository access requires a configured server-side GitHub credential.");
   }
@@ -511,7 +626,8 @@ async function findSuccessfulBaseline({ failedRun, repositoryPath, access }) {
   const eligible = runs.filter((candidate) => sameBaselineRun(candidate, failedRun, failedPrIdentity, failedTimestamp));
   eligible.sort((a, b) => runTimestamp(b.created_at) - runTimestamp(a.created_at));
   const baseline = eligible[0];
-  const searchCapped = runs.length >= MAX_SUCCESSFUL_RUNS || Number(result.total_count) > runs.length;
+  const count = workflowCount(result.total_count, result.incomplete_results === true);
+  const searchCapped = runs.length >= MAX_SUCCESSFUL_RUNS || count.count_accuracy !== "api_reported_exact" || count.total_count > runs.length;
   if (!baseline) return { status: "unavailable", reason: "no_eligible_successful_run_in_history", metadata, search_capped: searchCapped };
   return { status: "selected", run: summarizeWorkflowRun(baseline), rawRun: baseline, metadata, search_capped: searchCapped };
 }
@@ -593,6 +709,8 @@ export async function triageGitHubFailure({ owner, repo, failureLog, runId, bran
     comparison: `${base}...${head}`,
     failure_category: failure.category,
     summary,
+    evidence_strength: directFileMatches.length ? "direct_stack_path_overlap_not_proof_of_cause" : likelyChangedFiles.length ? "weak_filename_or_symbol_correlation" : "no_changed_file_connection_found",
+    current_ci_state: "not_established_by_historical_failure_triage",
     changed_file_count: allChangedFiles.length,
     changed_files: allChangedFiles.slice(0, 100).map(({ status, path: filePath }) => ({ status, path: filePath })),
     changed_files_truncated: allChangedFiles.length > 100,
